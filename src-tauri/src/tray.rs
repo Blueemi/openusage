@@ -1,7 +1,7 @@
 use tauri::image::Image;
-use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::menu::{CheckMenuItem, ContextMenu, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::path::BaseDirectory;
-use tauri::tray::{MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_nspanel::ManagerExt;
 use tauri_plugin_clipboard_manager::ClipboardExt;
@@ -158,8 +158,12 @@ pub fn create(app_handle: &AppHandle) -> tauri::Result<()> {
         .icon(icon)
         .icon_as_template(true)
         .tooltip("OpenUsage")
-        .menu(&menu)
-        .show_menu_on_left_click(false)
+        // Intentionally do NOT attach the menu to the tray icon. On macOS 26+
+        // (Tahoe) a menu set on the NSStatusItem pops up on left-click too,
+        // ignoring `show_menu_on_left_click(false)`. Instead we keep the menu
+        // detached and pop it up manually on right-click (see on_tray_icon_event),
+        // leaving left-click free to toggle the panel. Menu clicks still route
+        // through the global listener below.
         .on_menu_event(move |app_handle, event| {
             log::debug!("tray menu: {}", event.id.as_ref());
             match event.id.as_ref() {
@@ -212,14 +216,25 @@ pub fn create(app_handle: &AppHandle) -> tauri::Result<()> {
                 _ => {}
             }
         })
-        .on_tray_icon_event(|tray, event| {
+        .on_tray_icon_event(move |tray, event| {
             let app_handle = tray.app_handle();
 
-            if let TrayIconEvent::Click {
-                button_state, rect, ..
+            let TrayIconEvent::Click {
+                button,
+                button_state,
+                rect,
+                ..
             } = event
-            {
-                if button_state == MouseButtonState::Up {
+            else {
+                return;
+            };
+
+            match button {
+                // Left click toggles the panel.
+                MouseButton::Left => {
+                    if button_state != MouseButtonState::Up {
+                        return;
+                    }
                     let Some(panel) = get_or_init_panel!(app_handle) else {
                         return;
                     };
@@ -235,6 +250,23 @@ pub fn create(app_handle: &AppHandle) -> tauri::Result<()> {
                     panel.show_and_make_key();
                     position_panel_at_tray_icon(app_handle, rect.position, rect.size);
                 }
+                // Right click opens the menu. Pop it up manually (at the cursor)
+                // since it isn't attached to the tray icon. Down only, so the
+                // following Up event doesn't reopen it.
+                MouseButton::Right => {
+                    if button_state != MouseButtonState::Down {
+                        return;
+                    }
+                    log::debug!("tray right click: showing menu");
+                    let Some(window) = app_handle.get_webview_window("main") else {
+                        log::warn!("tray menu: main window not found");
+                        return;
+                    };
+                    if let Err(error) = menu.popup(window.as_ref().window()) {
+                        log::error!("failed to show tray menu: {}", error);
+                    }
+                }
+                _ => {}
             }
         })
         .build(app_handle)?;
