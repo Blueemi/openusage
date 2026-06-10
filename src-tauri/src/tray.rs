@@ -747,6 +747,7 @@ struct TrayInputOverlayViewIvars {
     menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
     status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
     status_view: objc2::rc::Retained<objc2_app_kit::NSView>,
+    suppress_next_mouse_up: std::cell::Cell<bool>,
     two_touch_menu_open: std::cell::Cell<bool>,
 }
 
@@ -765,14 +766,23 @@ objc2::define_class!(
         }
 
         #[unsafe(method(mouseDown:))]
-        fn mouse_down(&self, _event: &objc2_app_kit::NSEvent) {
+        fn mouse_down(&self, event: &objc2_app_kit::NSEvent) {
             self.update_tray_rect();
+            if should_open_tray_menu_from_native_event(event) {
+                self.ivars().suppress_next_mouse_up.set(true);
+                self.open_context_menu();
+            }
         }
 
         #[unsafe(method(mouseUp:))]
-        fn mouse_up(&self, _event: &objc2_app_kit::NSEvent) {
+        fn mouse_up(&self, event: &objc2_app_kit::NSEvent) {
             self.update_tray_rect();
-            toggle_panel(&self.ivars().app_handle);
+            match overlay_mouse_up_action(self.ivars().suppress_next_mouse_up.replace(false), event)
+            {
+                TrayOverlayMouseUpAction::Ignore => {}
+                TrayOverlayMouseUpAction::OpenMenu => self.open_context_menu(),
+                TrayOverlayMouseUpAction::TogglePanel => toggle_panel(&self.ivars().app_handle),
+            }
         }
 
         #[unsafe(method(rightMouseDown:))]
@@ -780,8 +790,20 @@ objc2::define_class!(
             self.open_context_menu();
         }
 
+        #[unsafe(method(rightMouseUp:))]
+        fn right_mouse_up(&self, _event: &objc2_app_kit::NSEvent) {
+            self.open_context_menu();
+        }
+
         #[unsafe(method(otherMouseDown:))]
         fn other_mouse_down(&self, event: &objc2_app_kit::NSEvent) {
+            if event.buttonNumber() > 0 {
+                self.open_context_menu();
+            }
+        }
+
+        #[unsafe(method(otherMouseUp:))]
+        fn other_mouse_up(&self, event: &objc2_app_kit::NSEvent) {
             if event.buttonNumber() > 0 {
                 self.open_context_menu();
             }
@@ -919,6 +941,7 @@ fn install_tray_input_overlay(
             menu: menu.retain(),
             status_item: status_item.retain(),
             status_view: status_view.retain(),
+            suppress_next_mouse_up: std::cell::Cell::new(false),
             two_touch_menu_open: std::cell::Cell::new(false),
         });
         let view: objc2::rc::Retained<TrayInputOverlayView> = msg_send![
@@ -1028,6 +1051,43 @@ fn should_open_tray_menu_from_touch_count(
 #[cfg(target_os = "macos")]
 fn should_reset_touch_menu_gate(touch_count: usize) -> bool {
     touch_count < 2
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrayOverlayMouseUpAction {
+    Ignore,
+    OpenMenu,
+    TogglePanel,
+}
+
+#[cfg(target_os = "macos")]
+fn overlay_mouse_up_action(
+    suppress_next_mouse_up: bool,
+    event: &objc2_app_kit::NSEvent,
+) -> TrayOverlayMouseUpAction {
+    overlay_mouse_up_action_details(
+        suppress_next_mouse_up,
+        event.r#type(),
+        event.modifierFlags(),
+        event.buttonNumber(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn overlay_mouse_up_action_details(
+    suppress_next_mouse_up: bool,
+    event_type: objc2_app_kit::NSEventType,
+    modifier_flags: objc2_app_kit::NSEventModifierFlags,
+    button_number: isize,
+) -> TrayOverlayMouseUpAction {
+    if suppress_next_mouse_up {
+        return TrayOverlayMouseUpAction::Ignore;
+    }
+    if should_open_tray_menu_from_native_event_details(event_type, modifier_flags, button_number) {
+        return TrayOverlayMouseUpAction::OpenMenu;
+    }
+    TrayOverlayMouseUpAction::TogglePanel
 }
 
 #[cfg(target_os = "macos")]
@@ -1812,6 +1872,49 @@ mod tests {
         assert!(should_reset_touch_menu_gate(0));
         assert!(should_reset_touch_menu_gate(1));
         assert!(!should_reset_touch_menu_gate(2));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tray_input_overlay_mouse_up_routes_context_click_shapes() {
+        use objc2_app_kit::{NSEventModifierFlags, NSEventType};
+
+        assert_eq!(
+            overlay_mouse_up_action_details(
+                false,
+                NSEventType::LeftMouseUp,
+                NSEventModifierFlags::empty(),
+                0
+            ),
+            TrayOverlayMouseUpAction::TogglePanel
+        );
+        assert_eq!(
+            overlay_mouse_up_action_details(
+                false,
+                NSEventType::RightMouseUp,
+                NSEventModifierFlags::empty(),
+                1
+            ),
+            TrayOverlayMouseUpAction::OpenMenu
+        );
+        assert_eq!(
+            overlay_mouse_up_action_details(
+                false,
+                NSEventType::LeftMouseUp,
+                NSEventModifierFlags::empty(),
+                1
+            ),
+            TrayOverlayMouseUpAction::OpenMenu
+        );
+        assert_eq!(
+            overlay_mouse_up_action_details(
+                true,
+                NSEventType::LeftMouseUp,
+                NSEventModifierFlags::empty(),
+                0
+            ),
+            TrayOverlayMouseUpAction::Ignore
+        );
     }
 
     #[cfg(target_os = "macos")]
