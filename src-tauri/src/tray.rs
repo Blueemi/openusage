@@ -351,6 +351,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         let status_window_number = window.windowNumber();
         let status_window: objc2::rc::Retained<NSWindow> = window.clone();
         install_status_item_event_tap(ns_menu, &status_item, &status_window);
+        install_secondary_click_poll_timer(ns_menu, &status_item, &status_window);
 
         let last_event_number = Cell::new(-1);
         let block = block2::RcBlock::new(move |event_ptr: NonNull<NSEvent>| -> *mut NSEvent {
@@ -428,6 +429,10 @@ struct NativeStatusButtonState {
     menu_ptr: usize,
     suppress_next_mouse_up: bool,
 }
+
+#[cfg(target_os = "macos")]
+type NativeStatusButtonStateMap =
+    std::sync::Mutex<std::collections::HashMap<usize, NativeStatusButtonState>>;
 
 #[cfg(target_os = "macos")]
 objc2::define_class!(
@@ -620,11 +625,8 @@ fn install_native_status_button(
 }
 
 #[cfg(target_os = "macos")]
-fn native_status_button_states(
-) -> &'static std::sync::Mutex<std::collections::HashMap<usize, NativeStatusButtonState>> {
-    static STATES: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<usize, NativeStatusButtonState>>,
-    > = std::sync::OnceLock::new();
+fn native_status_button_states() -> &'static NativeStatusButtonStateMap {
+    static STATES: std::sync::OnceLock<NativeStatusButtonStateMap> = std::sync::OnceLock::new();
 
     STATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -736,6 +738,55 @@ struct TrayEventTapState {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct TraySecondaryClickPollState {
+    menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
+    status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
+    window: objc2::rc::Retained<objc2_app_kit::NSWindow>,
+    secondary_button_was_down: std::cell::Cell<bool>,
+}
+
+#[cfg(target_os = "macos")]
+fn install_secondary_click_poll_timer(
+    menu: &objc2_app_kit::NSMenu,
+    status_item: &objc2_app_kit::NSStatusItem,
+    window: &objc2_app_kit::NSWindow,
+) {
+    use objc2_foundation::NSTimer;
+    use std::ptr::NonNull;
+
+    let state = std::rc::Rc::new(TraySecondaryClickPollState {
+        menu: menu.retain(),
+        status_item: status_item.retain(),
+        window: window.retain(),
+        secondary_button_was_down: std::cell::Cell::new(false),
+    });
+    let block_state = state.clone();
+    let block = block2::RcBlock::new(move |_timer: NonNull<NSTimer>| {
+        let secondary_button_is_down = is_secondary_mouse_button_pressed();
+        let secondary_button_was_down = block_state
+            .secondary_button_was_down
+            .replace(secondary_button_is_down);
+
+        if should_open_tray_menu_from_polled_button_state(
+            secondary_button_was_down,
+            secondary_button_is_down,
+            is_mouse_inside_window(&block_state.window),
+        ) {
+            show_native_tray_menu(&block_state.status_item, &block_state.menu);
+        }
+    });
+    let block_ref: &block2::DynBlock<dyn Fn(NonNull<NSTimer>)> = &block;
+    let timer =
+        unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.025, true, block_ref) };
+
+    std::mem::forget(state);
+    std::mem::forget(block);
+    std::mem::forget(timer);
+    log::debug!("tray context menu: installed secondary-click poll timer");
+}
+
+#[cfg(target_os = "macos")]
 fn install_status_item_event_tap(
     menu: &objc2_app_kit::NSMenu,
     status_item: &objc2_app_kit::NSStatusItem,
@@ -764,7 +815,7 @@ fn install_status_item_event_tap_at_location(
     window: &objc2_app_kit::NSWindow,
     location: objc2_core_graphics::CGEventTapLocation,
 ) {
-    use objc2_core_foundation::{kCFRunLoopCommonModes, CFMachPort, CFRunLoop};
+    use objc2_core_foundation::{CFMachPort, CFRunLoop, kCFRunLoopCommonModes};
     use objc2_core_graphics::{CGEvent, CGEventTapOptions, CGEventTapPlacement, CGEventType};
 
     let state = Box::new(TrayEventTapState {
@@ -878,6 +929,25 @@ fn should_open_tray_menu_from_cg_event_type(
         || event_type == CGEventType::OtherMouseUp
         || ((event_type == CGEventType::LeftMouseDown || event_type == CGEventType::LeftMouseUp)
             && flags.contains(CGEventFlags::MaskControl))
+}
+
+#[cfg(target_os = "macos")]
+fn is_secondary_mouse_button_pressed() -> bool {
+    use objc2_core_graphics::{CGEventSource, CGEventSourceStateID, CGMouseButton};
+
+    CGEventSource::button_state(
+        CGEventSourceStateID::CombinedSessionState,
+        CGMouseButton::Right,
+    ) || CGEventSource::button_state(CGEventSourceStateID::HIDSystemState, CGMouseButton::Right)
+}
+
+#[cfg(target_os = "macos")]
+fn should_open_tray_menu_from_polled_button_state(
+    secondary_button_was_down: bool,
+    secondary_button_is_down: bool,
+    cursor_inside_status_window: bool,
+) -> bool {
+    !secondary_button_was_down && secondary_button_is_down && cursor_inside_status_window
 }
 
 #[cfg(target_os = "macos")]
@@ -1274,6 +1344,23 @@ mod tests {
         assert!(!should_open_tray_menu_from_cg_event_type(
             CGEventType::LeftMouseUp,
             CGEventFlags::empty()
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn polled_secondary_click_opens_only_on_inside_down_edge() {
+        assert!(should_open_tray_menu_from_polled_button_state(
+            false, true, true
+        ));
+        assert!(!should_open_tray_menu_from_polled_button_state(
+            true, true, true
+        ));
+        assert!(!should_open_tray_menu_from_polled_button_state(
+            false, false, true
+        ));
+        assert!(!should_open_tray_menu_from_polled_button_state(
+            false, true, false
         ));
     }
 }
