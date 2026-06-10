@@ -328,13 +328,17 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         };
         let ns_menu = unsafe { &*(menu.ns_menu().cast::<NSMenu>()) };
         let local_ns_menu = ns_menu.retain();
+        let local_status_item = status_item.retain();
         let global_ns_menu = ns_menu.retain();
+        let global_status_item = status_item.retain();
         let button_view: &NSView = button.as_super().as_super().as_super();
         remove_status_item_overlay_subviews(button_view);
         set_context_menu_on_view_tree(button_view, ns_menu);
-        let status_button_target = TrayStatusButtonTarget::new(app_handle.clone(), ns_menu);
+        let status_button_target =
+            TrayStatusButtonTarget::new(app_handle.clone(), ns_menu, &status_item);
+        install_status_item_action(&status_item, &status_button_target);
         install_status_button_action(&button, &status_button_target);
-        let gesture_target = TrayMenuGestureTarget::new(ns_menu);
+        let gesture_target = TrayMenuGestureTarget::new(ns_menu, &status_item);
         attach_secondary_click_recognizers(button_view, &gesture_target);
 
         let Some(window) = button.window() else {
@@ -347,7 +351,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
 
         let status_window_number = window.windowNumber();
         let status_window: objc2::rc::Retained<NSWindow> = window.clone();
-        install_status_item_event_tap(ns_menu, &status_window);
+        install_status_item_event_tap(ns_menu, &status_item, &status_window);
 
         let last_event_number = Cell::new(-1);
         let block = block2::RcBlock::new(move |event_ptr: NonNull<NSEvent>| -> *mut NSEvent {
@@ -364,7 +368,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
             }
             last_event_number.set(event_number);
 
-            show_native_tray_menu(&local_ns_menu);
+            show_native_tray_menu(&local_status_item, &local_ns_menu);
 
             ptr::null_mut()
         });
@@ -400,7 +404,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
             }
             last_global_event_number.set(event_number);
 
-            show_native_tray_menu(&global_ns_menu);
+            show_native_tray_menu(&global_status_item, &global_ns_menu);
         });
         let global_block_ref: &block2::DynBlock<dyn Fn(NonNull<NSEvent>)> = &global_block;
         let global_token =
@@ -427,6 +431,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
 struct TrayStatusButtonTargetIvars {
     app_handle: AppHandle,
     menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
+    status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
 }
 
 #[cfg(target_os = "macos")]
@@ -438,7 +443,7 @@ objc2::define_class!(
 
     impl TrayStatusButtonTarget {
         #[unsafe(method(openUsageTrayStatusButtonAction:))]
-        fn open_status_button(&self, _sender: &objc2_app_kit::NSStatusBarButton) {
+        fn open_status_button(&self, _sender: &objc2::runtime::AnyObject) {
             let mtm = objc2_foundation::MainThreadMarker::new().expect("main thread");
             let Some(event) = objc2_app_kit::NSApplication::sharedApplication(mtm).currentEvent()
             else {
@@ -448,7 +453,7 @@ objc2::define_class!(
             };
 
             if should_open_tray_menu_from_native_event(&event) {
-                show_native_tray_menu(&self.ivars().menu);
+                show_native_tray_menu(&self.ivars().status_item, &self.ivars().menu);
                 return;
             }
 
@@ -461,14 +466,34 @@ objc2::define_class!(
 
 #[cfg(target_os = "macos")]
 impl TrayStatusButtonTarget {
-    fn new(app_handle: AppHandle, menu: &objc2_app_kit::NSMenu) -> objc2::rc::Retained<Self> {
+    fn new(
+        app_handle: AppHandle,
+        menu: &objc2_app_kit::NSMenu,
+        status_item: &objc2_app_kit::NSStatusItem,
+    ) -> objc2::rc::Retained<Self> {
         let mtm = objc2_foundation::MainThreadMarker::new().expect("main thread");
         let target = mtm.alloc().set_ivars(TrayStatusButtonTargetIvars {
             app_handle,
             menu: menu.retain(),
+            status_item: status_item.retain(),
         });
         unsafe { objc2::msg_send![super(target), init] }
     }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn install_status_item_action(
+    status_item: &objc2_app_kit::NSStatusItem,
+    target: &TrayStatusButtonTarget,
+) {
+    use objc2::ClassType;
+
+    unsafe {
+        status_item.setTarget(Some(target.as_super().as_super()));
+        status_item.setAction(Some(objc2::sel!(openUsageTrayStatusButtonAction:)));
+    }
+    status_item.sendActionOn(native_status_button_action_mask());
 }
 
 #[cfg(target_os = "macos")]
@@ -515,6 +540,7 @@ fn remove_status_item_overlay_subviews(view: &objc2_app_kit::NSView) {
 #[derive(Debug)]
 struct TrayMenuGestureTargetIvars {
     menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
+    status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
 }
 
 #[cfg(target_os = "macos")]
@@ -527,17 +553,21 @@ objc2::define_class!(
     impl TrayMenuGestureTarget {
         #[unsafe(method(openTrayMenu:))]
         fn open_tray_menu(&self, _sender: &objc2_app_kit::NSClickGestureRecognizer) {
-            show_native_tray_menu(&self.ivars().menu);
+            show_native_tray_menu(&self.ivars().status_item, &self.ivars().menu);
         }
     }
 );
 
 #[cfg(target_os = "macos")]
 impl TrayMenuGestureTarget {
-    fn new(menu: &objc2_app_kit::NSMenu) -> objc2::rc::Retained<Self> {
+    fn new(
+        menu: &objc2_app_kit::NSMenu,
+        status_item: &objc2_app_kit::NSStatusItem,
+    ) -> objc2::rc::Retained<Self> {
         let mtm = objc2_foundation::MainThreadMarker::new().expect("main thread");
         let target = mtm.alloc().set_ivars(TrayMenuGestureTargetIvars {
             menu: menu.retain(),
+            status_item: status_item.retain(),
         });
         unsafe { objc2::msg_send![super(target), init] }
     }
@@ -547,11 +577,16 @@ impl TrayMenuGestureTarget {
 #[derive(Debug)]
 struct TrayEventTapState {
     menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
+    status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
     window: objc2::rc::Retained<objc2_app_kit::NSWindow>,
 }
 
 #[cfg(target_os = "macos")]
-fn install_status_item_event_tap(menu: &objc2_app_kit::NSMenu, window: &objc2_app_kit::NSWindow) {
+fn install_status_item_event_tap(
+    menu: &objc2_app_kit::NSMenu,
+    status_item: &objc2_app_kit::NSStatusItem,
+    window: &objc2_app_kit::NSWindow,
+) {
     use objc2_core_foundation::{kCFRunLoopCommonModes, CFMachPort, CFRunLoop};
     use objc2_core_graphics::{
         CGEvent, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
@@ -559,6 +594,7 @@ fn install_status_item_event_tap(menu: &objc2_app_kit::NSMenu, window: &objc2_ap
 
     let state = Box::new(TrayEventTapState {
         menu: menu.retain(),
+        status_item: status_item.retain(),
         window: window.retain(),
     });
     let state_ptr = Box::into_raw(state);
@@ -623,7 +659,7 @@ unsafe extern "C-unwind" fn status_item_event_tap_callback(
     if should_open_tray_menu_from_cg_event(event_type, cg_event)
         && is_mouse_inside_window(&state.window)
     {
-        show_native_tray_menu(&state.menu);
+        show_native_tray_menu(&state.status_item, &state.menu);
     }
 
     event.as_ptr()
@@ -693,13 +729,13 @@ fn set_context_menu_on_view_tree(view: &objc2_app_kit::NSView, menu: &objc2_app_
 }
 
 #[cfg(target_os = "macos")]
-fn show_native_tray_menu(menu: &objc2_app_kit::NSMenu) {
+#[allow(deprecated)]
+fn show_native_tray_menu(status_item: &objc2_app_kit::NSStatusItem, menu: &objc2_app_kit::NSMenu) {
     if should_skip_recent_native_menu_open(std::time::Instant::now()) {
         return;
     }
 
-    let location = objc2_app_kit::NSEvent::mouseLocation();
-    menu.popUpMenuPositioningItem_atLocation_inView(None, location, None);
+    status_item.popUpStatusItemMenu(menu);
 }
 
 #[cfg(target_os = "macos")]
