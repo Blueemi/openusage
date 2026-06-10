@@ -522,7 +522,9 @@ impl NativeTrayStatusButton {
             return;
         };
         let menu = unsafe { &*(menu_ptr as *const objc2_app_kit::NSMenu) };
-        objc2_app_kit::NSMenu::popUpContextMenu_withEvent_forView(menu, event, self.as_view());
+        if !pop_up_native_tray_menu_at_view(menu, self.as_view()) {
+            objc2_app_kit::NSMenu::popUpContextMenu_withEvent_forView(menu, event, self.as_view());
+        }
     }
 
     fn set_button_highlighted(&self, highlighted: bool) {
@@ -714,10 +716,31 @@ fn install_status_item_event_tap(
     status_item: &objc2_app_kit::NSStatusItem,
     window: &objc2_app_kit::NSWindow,
 ) {
+    use objc2_core_graphics::CGEventTapLocation;
+
+    install_status_item_event_tap_at_location(
+        menu,
+        status_item,
+        window,
+        CGEventTapLocation::HIDEventTap,
+    );
+    install_status_item_event_tap_at_location(
+        menu,
+        status_item,
+        window,
+        CGEventTapLocation::SessionEventTap,
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn install_status_item_event_tap_at_location(
+    menu: &objc2_app_kit::NSMenu,
+    status_item: &objc2_app_kit::NSStatusItem,
+    window: &objc2_app_kit::NSWindow,
+    location: objc2_core_graphics::CGEventTapLocation,
+) {
     use objc2_core_foundation::{kCFRunLoopCommonModes, CFMachPort, CFRunLoop};
-    use objc2_core_graphics::{
-        CGEvent, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
-    };
+    use objc2_core_graphics::{CGEvent, CGEventTapOptions, CGEventTapPlacement, CGEventType};
 
     let state = Box::new(TrayEventTapState {
         menu: menu.retain(),
@@ -726,12 +749,15 @@ fn install_status_item_event_tap(
     });
     let state_ptr = Box::into_raw(state);
     let event_mask = cg_event_mask(CGEventType::RightMouseDown)
+        | cg_event_mask(CGEventType::RightMouseUp)
         | cg_event_mask(CGEventType::OtherMouseDown)
-        | cg_event_mask(CGEventType::LeftMouseDown);
+        | cg_event_mask(CGEventType::OtherMouseUp)
+        | cg_event_mask(CGEventType::LeftMouseDown)
+        | cg_event_mask(CGEventType::LeftMouseUp);
 
     let Some(tap) = (unsafe {
         CGEvent::tap_create(
-            CGEventTapLocation::SessionEventTap,
+            location,
             CGEventTapPlacement::HeadInsertEventTap,
             CGEventTapOptions::ListenOnly,
             event_mask,
@@ -740,13 +766,19 @@ fn install_status_item_event_tap(
         )
     }) else {
         let _ = unsafe { Box::from_raw(state_ptr) };
-        log::warn!("tray context menu: CoreGraphics event tap unavailable");
+        log::warn!(
+            "tray context menu: CoreGraphics {:?} event tap unavailable",
+            location
+        );
         return;
     };
 
     let Some(source) = CFMachPort::new_run_loop_source(None, Some(&tap), 0) else {
         let _ = unsafe { Box::from_raw(state_ptr) };
-        log::warn!("tray context menu: CoreGraphics event tap source unavailable");
+        log::warn!(
+            "tray context menu: CoreGraphics {:?} event tap source unavailable",
+            location
+        );
         return;
     };
 
@@ -755,10 +787,16 @@ fn install_status_item_event_tap(
         CGEvent::tap_enable(&tap, true);
         std::mem::forget(tap);
         std::mem::forget(source);
-        log::debug!("tray context menu: installed CoreGraphics event tap");
+        log::debug!(
+            "tray context menu: installed CoreGraphics {:?} event tap",
+            location
+        );
     } else {
         let _ = unsafe { Box::from_raw(state_ptr) };
-        log::warn!("tray context menu: CoreGraphics main run loop unavailable");
+        log::warn!(
+            "tray context menu: CoreGraphics {:?} main run loop unavailable",
+            location
+        );
     }
 }
 
@@ -797,12 +835,24 @@ fn should_open_tray_menu_from_cg_event(
     event_type: objc2_core_graphics::CGEventType,
     event: &objc2_core_graphics::CGEvent,
 ) -> bool {
-    use objc2_core_graphics::{CGEvent, CGEventFlags, CGEventType};
+    use objc2_core_graphics::CGEvent;
+
+    should_open_tray_menu_from_cg_event_type(event_type, CGEvent::flags(Some(event)))
+}
+
+#[cfg(target_os = "macos")]
+fn should_open_tray_menu_from_cg_event_type(
+    event_type: objc2_core_graphics::CGEventType,
+    flags: objc2_core_graphics::CGEventFlags,
+) -> bool {
+    use objc2_core_graphics::{CGEventFlags, CGEventType};
 
     event_type == CGEventType::RightMouseDown
+        || event_type == CGEventType::RightMouseUp
         || event_type == CGEventType::OtherMouseDown
-        || (event_type == CGEventType::LeftMouseDown
-            && CGEvent::flags(Some(event)).contains(CGEventFlags::MaskControl))
+        || event_type == CGEventType::OtherMouseUp
+        || ((event_type == CGEventType::LeftMouseDown || event_type == CGEventType::LeftMouseUp)
+            && flags.contains(CGEventFlags::MaskControl))
 }
 
 #[cfg(target_os = "macos")]
@@ -823,11 +873,38 @@ fn set_context_menu_on_view_tree(view: &objc2_app_kit::NSView, menu: &objc2_app_
 #[cfg(target_os = "macos")]
 #[allow(deprecated)]
 fn show_native_tray_menu(status_item: &objc2_app_kit::NSStatusItem, menu: &objc2_app_kit::NSMenu) {
+    use objc2::ClassType;
+
     if should_skip_recent_native_menu_open(std::time::Instant::now()) {
         return;
     }
 
+    let Some(mtm) = objc2_foundation::MainThreadMarker::new() else {
+        return;
+    };
+    let Some(button) = status_item.button(mtm) else {
+        status_item.popUpStatusItemMenu(menu);
+        return;
+    };
+    let view: &objc2_app_kit::NSView = button.as_super().as_super().as_super();
+    update_native_tray_rect_from_view(view);
+    if pop_up_native_tray_menu_at_view(menu, view) {
+        return;
+    }
+
     status_item.popUpStatusItemMenu(menu);
+}
+
+#[cfg(target_os = "macos")]
+fn pop_up_native_tray_menu_at_view(
+    menu: &objc2_app_kit::NSMenu,
+    view: &objc2_app_kit::NSView,
+) -> bool {
+    menu.popUpMenuPositioningItem_atLocation_inView(
+        None,
+        objc2_foundation::NSPoint::new(0.0, 0.0),
+        Some(view),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -1090,5 +1167,36 @@ mod tests {
             cg_event_mask(objc2_core_graphics::CGEventType::RightMouseDown),
             1u64 << 3
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn core_graphics_mouse_down_or_up_can_open_tray_menu() {
+        use objc2_core_graphics::{CGEventFlags, CGEventType};
+
+        assert!(should_open_tray_menu_from_cg_event_type(
+            CGEventType::RightMouseDown,
+            CGEventFlags::empty()
+        ));
+        assert!(should_open_tray_menu_from_cg_event_type(
+            CGEventType::RightMouseUp,
+            CGEventFlags::empty()
+        ));
+        assert!(should_open_tray_menu_from_cg_event_type(
+            CGEventType::OtherMouseDown,
+            CGEventFlags::empty()
+        ));
+        assert!(should_open_tray_menu_from_cg_event_type(
+            CGEventType::OtherMouseUp,
+            CGEventFlags::empty()
+        ));
+        assert!(should_open_tray_menu_from_cg_event_type(
+            CGEventType::LeftMouseUp,
+            CGEventFlags::MaskControl
+        ));
+        assert!(!should_open_tray_menu_from_cg_event_type(
+            CGEventType::LeftMouseUp,
+            CGEventFlags::empty()
+        ));
     }
 }
