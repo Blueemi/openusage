@@ -264,9 +264,8 @@ pub fn create(app_handle: &AppHandle) -> tauri::Result<()> {
                     panel.show_and_make_key();
                     position_panel_at_tray_icon(app_handle, rect.position, rect.size);
                 }
-                // Right click opens the menu. Pop it up manually (at the cursor)
-                // since it isn't attached to the tray icon. Up only avoids the
-                // press/release cycle immediately dismissing the menu on newer macOS.
+                // Non-macOS right-clicks still pop up the detached Tauri menu.
+                // macOS uses the AppKit contextual menu installed on the status button.
                 MouseButton::Right => {
                     if !should_open_tray_menu(button, button_state) {
                         return;
