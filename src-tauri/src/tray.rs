@@ -15,8 +15,7 @@ const LOG_LEVEL_STORE_KEY: &str = "logLevel";
 fn should_open_tray_menu(button: MouseButton, button_state: MouseButtonState) -> bool {
     #[cfg(target_os = "macos")]
     {
-        let _ = (button, button_state);
-        false
+        button == MouseButton::Right && button_state == MouseButtonState::Down
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -296,7 +295,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
     if let Err(error) = tray.with_inner_tray_icon(move |inner| {
         use muda::ContextMenu as _;
         use objc2::ClassType;
-        use objc2_app_kit::{NSMenu, NSResponder};
+        use objc2_app_kit::{NSMenu, NSView};
         use objc2_foundation::MainThreadMarker;
 
         let Some(mtm) = MainThreadMarker::new() else {
@@ -322,15 +321,31 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
             }
         };
         let ns_menu = unsafe { &*(menu.ns_menu().cast::<NSMenu>()) };
-        let responder: &NSResponder = button.as_super().as_super().as_super().as_super();
-        unsafe {
-            responder.setMenu(Some(ns_menu));
-        }
+        let button_view: &NSView = button.as_super().as_super().as_super();
+        set_context_menu_on_view_tree(button_view, ns_menu);
 
         // NSMenu keeps a weak delegate; keep the muda menu alive for app lifetime.
         std::mem::forget(menu);
     }) {
         log::warn!("tray context menu: failed to install native menu: {error}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_context_menu_on_view_tree(
+    view: &objc2_app_kit::NSView,
+    menu: &objc2_app_kit::NSMenu,
+) {
+    use objc2::ClassType;
+    use objc2_app_kit::NSResponder;
+
+    let responder: &NSResponder = view.as_super();
+    unsafe {
+        responder.setMenu(Some(menu));
+    }
+
+    for subview in view.subviews() {
+        set_context_menu_on_view_tree(&subview, menu);
     }
 }
 
@@ -412,13 +427,13 @@ mod tests {
     fn manual_tray_menu_opening_matches_platform_behavior() {
         #[cfg(target_os = "macos")]
         {
-            assert!(!should_open_tray_menu(
+            assert!(should_open_tray_menu(
                 MouseButton::Right,
-                MouseButtonState::Up
+                MouseButtonState::Down
             ));
             assert!(!should_open_tray_menu(
                 MouseButton::Right,
-                MouseButtonState::Down
+                MouseButtonState::Up
             ));
             assert!(!should_open_tray_menu(
                 MouseButton::Left,
