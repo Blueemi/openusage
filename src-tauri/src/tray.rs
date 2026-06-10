@@ -264,7 +264,7 @@ pub fn create(app_handle: &AppHandle) -> tauri::Result<()> {
                     position_panel_at_tray_icon(app_handle, rect.position, rect.size);
                 }
                 // Non-macOS right-clicks still pop up the detached Tauri menu.
-                // macOS uses the AppKit contextual menu installed on the status button.
+                // macOS handles status-item secondary clicks in the native monitor.
                 MouseButton::Right => {
                     if !should_open_tray_menu(button, button_state) {
                         return;
@@ -295,8 +295,12 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
     if let Err(error) = tray.with_inner_tray_icon(move |inner| {
         use muda::ContextMenu as _;
         use objc2::ClassType;
-        use objc2_app_kit::{NSMenu, NSView};
+        use objc2_app_kit::{NSEvent, NSEventMask, NSMenu, NSView};
         use objc2_foundation::MainThreadMarker;
+        use std::cell::Cell;
+        use std::ffi::c_void;
+        use std::ptr;
+        use std::ptr::NonNull;
 
         let Some(mtm) = MainThreadMarker::new() else {
             log::warn!("tray context menu: not on main thread");
@@ -324,8 +328,53 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         let button_view: &NSView = button.as_super().as_super().as_super();
         set_context_menu_on_view_tree(button_view, ns_menu);
 
-        // NSMenu keeps a weak delegate; keep the muda menu alive for app lifetime.
-        std::mem::forget(menu);
+        let Some(window) = button.window() else {
+            log::warn!("tray context menu: status item window unavailable");
+            std::mem::forget(menu);
+            return;
+        };
+
+        let status_window_number = window.windowNumber();
+        let button_view_ptr = button_view as *const NSView as *const c_void;
+        let last_event_number = Cell::new(-1);
+        let block = block2::RcBlock::new(move |event_ptr: NonNull<NSEvent>| -> *mut NSEvent {
+            let event = unsafe { event_ptr.as_ref() };
+            if event.windowNumber() != status_window_number
+                || !should_open_tray_menu_from_native_event(event)
+            {
+                return event_ptr.as_ptr();
+            }
+
+            let event_number = event.eventNumber();
+            if event_number == last_event_number.get() {
+                return ptr::null_mut();
+            }
+            last_event_number.set(event_number);
+
+            unsafe {
+                menu.show_context_menu_for_nsview(button_view_ptr, None);
+            }
+
+            ptr::null_mut()
+        });
+        let block_ref: &block2::DynBlock<dyn Fn(NonNull<NSEvent>) -> *mut NSEvent> = &block;
+        let mask = NSEventMask::RightMouseDown
+            | NSEventMask::LeftMouseDown
+            | NSEventMask::OtherMouseDown
+            | NSEventMask::Gesture
+            | NSEventMask::BeginGesture
+            | NSEventMask::Pressure
+            | NSEventMask::DirectTouch
+            | NSEventMask::SystemDefined;
+        let token =
+            unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, block_ref) };
+        if let Some(token) = token {
+            std::mem::forget(token);
+        } else {
+            log::warn!("tray context menu: AppKit did not install event monitor");
+        }
+        // NSMenu keeps a weak delegate; leaking the block keeps its muda menu alive.
+        std::mem::forget(block);
     }) {
         log::warn!("tray context menu: failed to install native menu: {error}");
     }
@@ -347,6 +396,29 @@ fn set_context_menu_on_view_tree(
     for subview in view.subviews() {
         set_context_menu_on_view_tree(&subview, menu);
     }
+}
+
+#[cfg(target_os = "macos")]
+fn should_open_tray_menu_from_native_event(event: &objc2_app_kit::NSEvent) -> bool {
+    should_open_tray_menu_from_native_event_type(event.r#type(), event.modifierFlags())
+}
+
+#[cfg(target_os = "macos")]
+fn should_open_tray_menu_from_native_event_type(
+    event_type: objc2_app_kit::NSEventType,
+    modifier_flags: objc2_app_kit::NSEventModifierFlags,
+) -> bool {
+    use objc2_app_kit::{NSEventModifierFlags, NSEventType};
+
+    event_type == NSEventType::RightMouseDown
+        || event_type == NSEventType::OtherMouseDown
+        || (event_type == NSEventType::LeftMouseDown
+            && modifier_flags.contains(NSEventModifierFlags::Control))
+        || event_type == NSEventType::Gesture
+        || event_type == NSEventType::BeginGesture
+        || event_type == NSEventType::Pressure
+        || event_type == NSEventType::DirectTouch
+        || event_type == NSEventType::SystemDefined
 }
 
 #[cfg(target_os = "macos")]
@@ -456,5 +528,36 @@ mod tests {
                 MouseButtonState::Up
             ));
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_status_item_events_open_tray_menu() {
+        use objc2_app_kit::{NSEventModifierFlags, NSEventType};
+
+        assert!(should_open_tray_menu_from_native_event_type(
+            NSEventType::RightMouseDown,
+            NSEventModifierFlags::empty()
+        ));
+        assert!(should_open_tray_menu_from_native_event_type(
+            NSEventType::OtherMouseDown,
+            NSEventModifierFlags::empty()
+        ));
+        assert!(should_open_tray_menu_from_native_event_type(
+            NSEventType::LeftMouseDown,
+            NSEventModifierFlags::Control
+        ));
+        assert!(should_open_tray_menu_from_native_event_type(
+            NSEventType::Gesture,
+            NSEventModifierFlags::empty()
+        ));
+        assert!(!should_open_tray_menu_from_native_event_type(
+            NSEventType::LeftMouseDown,
+            NSEventModifierFlags::empty()
+        ));
+        assert!(!should_open_tray_menu_from_native_event_type(
+            NSEventType::RightMouseUp,
+            NSEventModifierFlags::empty()
+        ));
     }
 }
