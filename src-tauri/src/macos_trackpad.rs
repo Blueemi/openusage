@@ -9,13 +9,40 @@ use objc2_app_kit::{NSMenu, NSStatusItem, NSView};
 type MTDeviceRef = *mut libc::c_void;
 type CFArrayRef = *const libc::c_void;
 type CFIndex = isize;
-type MTContactCallback = unsafe extern "C" fn(
-    MTDeviceRef,
-    *mut libc::c_void,
-    libc::c_int,
-    libc::c_double,
-    libc::c_int,
-) -> libc::c_int;
+#[repr(C)]
+struct MTPoint {
+    _x: f32,
+    _y: f32,
+}
+
+#[repr(C)]
+struct MTVector {
+    _position: MTPoint,
+    _velocity: MTPoint,
+}
+
+#[repr(C)]
+struct MTTouch {
+    _frame: i32,
+    _timestamp: f64,
+    _path_index: i32,
+    state: i32,
+    _finger_id: i32,
+    _hand_id: i32,
+    _normalized: MTVector,
+    z_total: f32,
+    _field_9: i32,
+    _angle: f32,
+    _major_axis: f32,
+    _minor_axis: f32,
+    _absolute: MTVector,
+    _field_14: i32,
+    _field_15: i32,
+    z_density: f32,
+}
+
+type MTContactCallback =
+    unsafe extern "C" fn(MTDeviceRef, *mut MTTouch, usize, libc::c_double, usize);
 type MTDeviceCreateDefault = unsafe extern "C" fn() -> MTDeviceRef;
 type MTDeviceCreateList = unsafe extern "C" fn() -> CFArrayRef;
 type MTRegisterContactFrameCallback = unsafe extern "C" fn(MTDeviceRef, MTContactCallback);
@@ -52,6 +79,7 @@ struct RawTrackpadMenuTimerState {
     status_view: objc2::rc::Retained<NSView>,
     touch_state: Arc<RawTrackpadTouchState>,
     two_finger_was_active: std::cell::Cell<bool>,
+    two_finger_sequence_inside_status_view: std::cell::Cell<bool>,
 }
 
 struct MultitouchSupportRuntime {
@@ -115,6 +143,7 @@ fn install_raw_trackpad_menu_timer(
         status_view: status_view.retain(),
         touch_state,
         two_finger_was_active: std::cell::Cell::new(false),
+        two_finger_sequence_inside_status_view: std::cell::Cell::new(false),
     });
     let block_state = state.clone();
     let block = block2::RcBlock::new(move |_timer: NonNull<NSTimer>| {
@@ -123,19 +152,33 @@ fn install_raw_trackpad_menu_timer(
             .active_fingers
             .load(Ordering::SeqCst);
         let two_finger_is_active = active_fingers >= 2;
+        let cursor_inside_status_view =
+            crate::tray::is_mouse_inside_status_view(&block_state.status_view);
         let two_finger_was_active = block_state
             .two_finger_was_active
             .replace(two_finger_is_active);
+        let sequence_inside_status_view = block_state.two_finger_sequence_inside_status_view.get()
+            || (two_finger_is_active && cursor_inside_status_view);
+        block_state
+            .two_finger_sequence_inside_status_view
+            .set(sequence_inside_status_view);
 
-        if should_open_raw_trackpad_menu(
+        if should_open_raw_trackpad_menu_on_sequence_end(
             two_finger_was_active,
             two_finger_is_active,
-            crate::tray::is_mouse_inside_status_view(&block_state.status_view),
+            sequence_inside_status_view,
         ) {
+            block_state
+                .two_finger_sequence_inside_status_view
+                .set(false);
             log::debug!(
-                "tray context menu: raw trackpad two-finger fallback active_fingers={active_fingers}"
+                "tray context menu: raw trackpad two-finger sequence ended active_fingers={active_fingers}"
             );
             crate::tray::show_native_tray_menu(&block_state.status_item, &block_state.menu);
+        } else if !two_finger_is_active {
+            block_state
+                .two_finger_sequence_inside_status_view
+                .set(false);
         }
     });
     let block_ref: &block2::DynBlock<dyn Fn(NonNull<NSTimer>)> = &block;
@@ -248,26 +291,51 @@ fn dl_error() -> String {
 
 unsafe extern "C" fn raw_trackpad_contact_callback(
     _device: MTDeviceRef,
-    _touches: *mut libc::c_void,
-    active_fingers: libc::c_int,
+    touches: *mut MTTouch,
+    touch_count: usize,
     _timestamp: libc::c_double,
-    _frame: libc::c_int,
-) -> libc::c_int {
+    _frame: usize,
+) {
     if let Some(state) = RAW_TRACKPAD_TOUCH_STATE.get() {
-        state
-            .active_fingers
-            .store(active_fingers.max(0) as usize, Ordering::SeqCst);
+        let active_fingers = raw_active_touch_count(touches, touch_count);
+        let previous = state.active_fingers.swap(active_fingers, Ordering::SeqCst);
+        if previous != active_fingers {
+            log::debug!(
+                "tray context menu: raw trackpad active_fingers={active_fingers} touch_count={touch_count}"
+            );
+        }
     }
-
-    0
 }
 
-fn should_open_raw_trackpad_menu(
+fn raw_active_touch_count(touches: *const MTTouch, touch_count: usize) -> usize {
+    if touches.is_null() {
+        return touch_count;
+    }
+
+    let touching_count = (0..touch_count)
+        .filter(|index| {
+            let touch = unsafe { &*touches.add(*index) };
+            raw_touch_is_active(touch.state, touch.z_total, touch.z_density)
+        })
+        .count();
+
+    if touching_count > 0 {
+        touching_count
+    } else {
+        touch_count
+    }
+}
+
+fn raw_touch_is_active(state: i32, z_total: f32, z_density: f32) -> bool {
+    matches!(state, 3 | 4) || z_total > 0.0 || z_density > 0.0
+}
+
+fn should_open_raw_trackpad_menu_on_sequence_end(
     two_finger_was_active: bool,
     two_finger_is_active: bool,
-    cursor_inside_status_view: bool,
+    two_finger_sequence_inside_status_view: bool,
 ) -> bool {
-    !two_finger_was_active && two_finger_is_active && cursor_inside_status_view
+    two_finger_was_active && !two_finger_is_active && two_finger_sequence_inside_status_view
 }
 
 #[cfg(test)]
@@ -275,10 +343,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn raw_trackpad_menu_opens_on_two_finger_enter_inside_status_view() {
-        assert!(should_open_raw_trackpad_menu(false, true, true));
-        assert!(!should_open_raw_trackpad_menu(true, true, true));
-        assert!(!should_open_raw_trackpad_menu(false, false, true));
-        assert!(!should_open_raw_trackpad_menu(false, true, false));
+    fn raw_trackpad_menu_opens_when_two_finger_sequence_ends_inside_status_view() {
+        assert!(should_open_raw_trackpad_menu_on_sequence_end(
+            true, false, true
+        ));
+        assert!(!should_open_raw_trackpad_menu_on_sequence_end(
+            false, true, true
+        ));
+        assert!(!should_open_raw_trackpad_menu_on_sequence_end(
+            true, true, true
+        ));
+        assert!(!should_open_raw_trackpad_menu_on_sequence_end(
+            true, false, false
+        ));
+    }
+
+    #[test]
+    fn raw_touch_count_prefers_active_touch_states() {
+        let touches = [
+            MTTouch {
+                _frame: 0,
+                _timestamp: 0.0,
+                _path_index: 0,
+                state: 2,
+                _finger_id: 0,
+                _hand_id: 0,
+                _normalized: MTVector {
+                    _position: MTPoint { _x: 0.0, _y: 0.0 },
+                    _velocity: MTPoint { _x: 0.0, _y: 0.0 },
+                },
+                z_total: 0.0,
+                _field_9: 0,
+                _angle: 0.0,
+                _major_axis: 0.0,
+                _minor_axis: 0.0,
+                _absolute: MTVector {
+                    _position: MTPoint { _x: 0.0, _y: 0.0 },
+                    _velocity: MTPoint { _x: 0.0, _y: 0.0 },
+                },
+                _field_14: 0,
+                _field_15: 0,
+                z_density: 0.0,
+            },
+            MTTouch {
+                _frame: 0,
+                _timestamp: 0.0,
+                _path_index: 0,
+                state: 4,
+                _finger_id: 1,
+                _hand_id: 0,
+                _normalized: MTVector {
+                    _position: MTPoint { _x: 0.0, _y: 0.0 },
+                    _velocity: MTPoint { _x: 0.0, _y: 0.0 },
+                },
+                z_total: 0.0,
+                _field_9: 0,
+                _angle: 0.0,
+                _major_axis: 0.0,
+                _minor_axis: 0.0,
+                _absolute: MTVector {
+                    _position: MTPoint { _x: 0.0, _y: 0.0 },
+                    _velocity: MTPoint { _x: 0.0, _y: 0.0 },
+                },
+                _field_14: 0,
+                _field_15: 0,
+                z_density: 0.0,
+            },
+        ];
+
+        assert_eq!(raw_active_touch_count(touches.as_ptr(), touches.len()), 1);
+        assert_eq!(raw_active_touch_count(std::ptr::null(), 2), 2);
     }
 }
