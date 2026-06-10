@@ -11,7 +11,7 @@ use crate::log_path;
 use crate::panel::{get_or_init_panel, position_panel_at_tray_icon, show_panel, toggle_panel};
 
 #[cfg(target_os = "macos")]
-use objc2::{DefinedClass as _, MainThreadOnly as _, Message as _};
+use objc2::{DefinedClass as _, Message as _};
 
 const LOG_LEVEL_STORE_KEY: &str = "logLevel";
 
@@ -334,18 +334,14 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         let button_view: &NSView = button.as_super().as_super().as_super();
         remove_status_item_overlay_subviews(button_view);
         set_context_menu_on_view_tree(button_view, ns_menu);
-        let status_button_target =
-            TrayStatusButtonTarget::new(app_handle.clone(), ns_menu, &status_item);
-        install_status_item_action(&status_item, &status_button_target);
-        install_status_button_action(&button, &status_button_target);
-        let gesture_target = TrayMenuGestureTarget::new(ns_menu, &status_item);
-        attach_secondary_click_recognizers(button_view, &gesture_target);
+        let status_mouse_target =
+            TrayStatusMouseTarget::new(app_handle.clone(), ns_menu, &status_item);
+        install_status_mouse_target_view(button_view, &status_mouse_target);
 
         let Some(window) = button.window() else {
             log::warn!("tray context menu: status item window unavailable");
             std::mem::forget(menu);
-            std::mem::forget(status_button_target);
-            std::mem::forget(gesture_target);
+            std::mem::forget(status_mouse_target);
             return;
         };
 
@@ -417,8 +413,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
 
         // NSMenu keeps a weak delegate; keep all native monitor state alive.
         std::mem::forget(menu);
-        std::mem::forget(status_button_target);
-        std::mem::forget(gesture_target);
+        std::mem::forget(status_mouse_target);
         std::mem::forget(block);
         std::mem::forget(global_block);
     }) {
@@ -428,95 +423,130 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
 
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
-struct TrayStatusButtonTargetIvars {
+struct TrayStatusMouseTargetIvars {
     app_handle: AppHandle,
     menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
     status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
+    suppress_next_mouse_up: std::cell::Cell<bool>,
 }
 
 #[cfg(target_os = "macos")]
 objc2::define_class!(
-    #[unsafe(super(objc2_foundation::NSObject))]
-    #[name = "OpenUsageTrayStatusButtonTarget"]
-    #[ivars = TrayStatusButtonTargetIvars]
-    struct TrayStatusButtonTarget;
+    #[unsafe(super(objc2_app_kit::NSView))]
+    #[name = "OpenUsageTrayStatusMouseTarget"]
+    #[ivars = TrayStatusMouseTargetIvars]
+    struct TrayStatusMouseTarget;
 
-    impl TrayStatusButtonTarget {
-        #[unsafe(method(openUsageTrayStatusButtonAction:))]
-        fn open_status_button(&self, _sender: &objc2::runtime::AnyObject) {
-            let mtm = objc2_foundation::MainThreadMarker::new().expect("main thread");
-            let Some(event) = objc2_app_kit::NSApplication::sharedApplication(mtm).currentEvent()
-            else {
-                log::warn!("tray status button action: current event unavailable");
-                toggle_panel(&self.ivars().app_handle);
-                return;
-            };
-
-            if should_open_tray_menu_from_native_event(&event) {
-                show_native_tray_menu(&self.ivars().status_item, &self.ivars().menu);
-                return;
-            }
-
-            if event.r#type() == objc2_app_kit::NSEventType::LeftMouseDown {
-                toggle_panel(&self.ivars().app_handle);
-            }
+    impl TrayStatusMouseTarget {
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&objc2_app_kit::NSEvent>) -> bool {
+            true
         }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &objc2_app_kit::NSEvent) {
+            if should_open_tray_menu_from_native_event(event)
+                || should_open_tray_menu_from_mouse_button_number(event.buttonNumber())
+            {
+                self.ivars().suppress_next_mouse_up.set(true);
+                self.open_context_menu(event);
+                return;
+            }
+
+            self.set_button_highlighted(true);
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, _event: &objc2_app_kit::NSEvent) {
+            self.set_button_highlighted(false);
+            if self.ivars().suppress_next_mouse_up.replace(false) {
+                return;
+            }
+            toggle_panel(&self.ivars().app_handle);
+        }
+
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, event: &objc2_app_kit::NSEvent) {
+            self.open_context_menu(event);
+        }
+
+        #[unsafe(method(otherMouseDown:))]
+        fn other_mouse_down(&self, event: &objc2_app_kit::NSEvent) {
+            self.open_context_menu(event);
+        }
+
     }
 );
 
 #[cfg(target_os = "macos")]
-impl TrayStatusButtonTarget {
+impl TrayStatusMouseTarget {
     fn new(
         app_handle: AppHandle,
         menu: &objc2_app_kit::NSMenu,
         status_item: &objc2_app_kit::NSStatusItem,
     ) -> objc2::rc::Retained<Self> {
         let mtm = objc2_foundation::MainThreadMarker::new().expect("main thread");
-        let target = mtm.alloc().set_ivars(TrayStatusButtonTargetIvars {
+        let target = mtm.alloc().set_ivars(TrayStatusMouseTargetIvars {
             app_handle,
             menu: menu.retain(),
             status_item: status_item.retain(),
+            suppress_next_mouse_up: std::cell::Cell::new(false),
         });
-        unsafe { objc2::msg_send![super(target), init] }
+        unsafe {
+            objc2::msg_send![
+                super(target),
+                initWithFrame: objc2_foundation::NSRect::new(
+                    objc2_foundation::NSPoint::new(0.0, 0.0),
+                    objc2_foundation::NSSize::new(0.0, 0.0)
+                )
+            ]
+        }
+    }
+
+    fn open_context_menu(&self, event: &objc2_app_kit::NSEvent) {
+        use objc2::ClassType;
+
+        if should_skip_recent_native_menu_open(std::time::Instant::now()) {
+            return;
+        }
+
+        let view: &objc2_app_kit::NSView = self.as_super();
+        objc2_app_kit::NSMenu::popUpContextMenu_withEvent_forView(&self.ivars().menu, event, view);
+    }
+
+    fn set_button_highlighted(&self, highlighted: bool) {
+        let mtm = objc2_foundation::MainThreadMarker::new().expect("main thread");
+        if let Some(button) = self.ivars().status_item.button(mtm) {
+            button.highlight(highlighted);
+        }
     }
 }
 
 #[cfg(target_os = "macos")]
-#[allow(deprecated)]
-fn install_status_item_action(
-    status_item: &objc2_app_kit::NSStatusItem,
-    target: &TrayStatusButtonTarget,
+fn install_status_mouse_target_view(
+    button_view: &objc2_app_kit::NSView,
+    target: &TrayStatusMouseTarget,
 ) {
     use objc2::ClassType;
 
-    unsafe {
-        status_item.setTarget(Some(target.as_super().as_super()));
-        status_item.setAction(Some(objc2::sel!(openUsageTrayStatusButtonAction:)));
-    }
-    status_item.sendActionOn(native_status_button_action_mask());
+    let target_view: &objc2_app_kit::NSView = target.as_super();
+    target_view.setFrame(button_view.bounds());
+    target_view.setAutoresizingMask(status_mouse_target_autoresizing_mask());
+    button_view.addSubview(target_view);
 }
 
 #[cfg(target_os = "macos")]
-fn install_status_button_action(
-    button: &objc2_app_kit::NSStatusBarButton,
-    target: &TrayStatusButtonTarget,
-) {
-    use objc2::ClassType;
-    use objc2_app_kit::NSControl;
+fn status_mouse_target_autoresizing_mask() -> objc2_app_kit::NSAutoresizingMaskOptions {
+    use objc2_app_kit::NSAutoresizingMaskOptions;
 
-    let control: &NSControl = button.as_super().as_super();
-    unsafe {
-        control.setTarget(Some(target.as_super().as_super()));
-        control.setAction(Some(objc2::sel!(openUsageTrayStatusButtonAction:)));
-    }
-    control.sendActionOn(native_status_button_action_mask());
+    NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable
 }
 
 #[cfg(target_os = "macos")]
-fn native_status_button_action_mask() -> objc2_app_kit::NSEventMask {
-    use objc2_app_kit::NSEventMask;
-
-    NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown | NSEventMask::OtherMouseDown
+fn should_open_tray_menu_from_mouse_button_number(
+    button_number: objc2_foundation::NSInteger,
+) -> bool {
+    button_number > 0
 }
 
 #[cfg(target_os = "macos")]
@@ -533,43 +563,6 @@ fn remove_status_item_overlay_subviews(view: &objc2_app_kit::NSView) {
 
     if removed_count > 0 {
         log::debug!("tray context menu: removed {removed_count} status button overlay subview(s)");
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug)]
-struct TrayMenuGestureTargetIvars {
-    menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
-    status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
-}
-
-#[cfg(target_os = "macos")]
-objc2::define_class!(
-    #[unsafe(super(objc2_foundation::NSObject))]
-    #[name = "OpenUsageTrayMenuGestureTarget"]
-    #[ivars = TrayMenuGestureTargetIvars]
-    struct TrayMenuGestureTarget;
-
-    impl TrayMenuGestureTarget {
-        #[unsafe(method(openTrayMenu:))]
-        fn open_tray_menu(&self, _sender: &objc2_app_kit::NSClickGestureRecognizer) {
-            show_native_tray_menu(&self.ivars().status_item, &self.ivars().menu);
-        }
-    }
-);
-
-#[cfg(target_os = "macos")]
-impl TrayMenuGestureTarget {
-    fn new(
-        menu: &objc2_app_kit::NSMenu,
-        status_item: &objc2_app_kit::NSStatusItem,
-    ) -> objc2::rc::Retained<Self> {
-        let mtm = objc2_foundation::MainThreadMarker::new().expect("main thread");
-        let target = mtm.alloc().set_ivars(TrayMenuGestureTargetIvars {
-            menu: menu.retain(),
-            status_item: status_item.retain(),
-        });
-        unsafe { objc2::msg_send![super(target), init] }
     }
 }
 
@@ -676,41 +669,6 @@ fn should_open_tray_menu_from_cg_event(
         || event_type == CGEventType::OtherMouseDown
         || (event_type == CGEventType::LeftMouseDown
             && CGEvent::flags(Some(event)).contains(CGEventFlags::MaskControl))
-}
-
-#[cfg(target_os = "macos")]
-fn attach_secondary_click_recognizers(
-    view: &objc2_app_kit::NSView,
-    target: &TrayMenuGestureTarget,
-) {
-    use objc2::ClassType;
-    use objc2_app_kit::{NSClickGestureRecognizer, NSGestureRecognizer};
-
-    unsafe {
-        let recognizer = NSClickGestureRecognizer::initWithTarget_action(
-            NSClickGestureRecognizer::alloc(
-                objc2_foundation::MainThreadMarker::new().expect("main thread"),
-            ),
-            Some(target.as_super().as_super()),
-            Some(objc2::sel!(openTrayMenu:)),
-        );
-        recognizer.setButtonMask(secondary_click_button_mask());
-        recognizer.setNumberOfClicksRequired(1);
-        recognizer.setDelaysPrimaryMouseButtonEvents(false);
-        recognizer.setDelaysSecondaryMouseButtonEvents(false);
-
-        let recognizer: &NSGestureRecognizer = recognizer.as_super();
-        view.addGestureRecognizer(recognizer);
-    }
-
-    for subview in view.subviews() {
-        attach_secondary_click_recognizers(&subview, target);
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn secondary_click_button_mask() -> objc2_foundation::NSUInteger {
-    (1usize << 1) as objc2_foundation::NSUInteger
 }
 
 #[cfg(target_os = "macos")]
@@ -964,18 +922,10 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn secondary_click_gesture_uses_right_button_mask() {
-        assert_eq!(secondary_click_button_mask(), 2);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn native_status_button_action_mask_includes_secondary_clicks() {
-        let mask = native_status_button_action_mask();
-
-        assert!(mask.contains(objc2_app_kit::NSEventMask::LeftMouseDown));
-        assert!(mask.contains(objc2_app_kit::NSEventMask::RightMouseDown));
-        assert!(mask.contains(objc2_app_kit::NSEventMask::OtherMouseDown));
+    fn non_primary_mouse_buttons_open_tray_menu() {
+        assert!(!should_open_tray_menu_from_mouse_button_number(0));
+        assert!(should_open_tray_menu_from_mouse_button_number(1));
+        assert!(should_open_tray_menu_from_mouse_button_number(2));
     }
 
     #[cfg(target_os = "macos")]
