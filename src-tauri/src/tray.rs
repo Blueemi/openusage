@@ -551,10 +551,7 @@ fn install_status_view_context_click_gestures_with_target(
     view: &objc2_app_kit::NSView,
     target: &TrayStatusButtonActionTarget,
 ) {
-    use objc2_app_kit::NSTouchTypeMask;
-
-    view.setWantsRestingTouches(true);
-    view.setAllowedTouchTypes(NSTouchTypeMask::Indirect);
+    accept_indirect_touch_events(view);
     install_status_view_context_click_gestures_on_view(view, target);
 
     for subview in view.subviews() {
@@ -951,8 +948,7 @@ fn install_tray_input_overlay(
         view
     };
     let overlay_ns_view: &objc2_app_kit::NSView = overlay_view.as_super();
-    overlay_ns_view.setWantsRestingTouches(true);
-    overlay_ns_view.setAllowedTouchTypes(objc2_app_kit::NSTouchTypeMask::Indirect);
+    accept_indirect_touch_events(overlay_ns_view);
     overlay_ns_view.setAutoresizingMask(
         objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
             | objc2_app_kit::NSAutoresizingMaskOptions::ViewHeightSizable,
@@ -1028,6 +1024,14 @@ fn tray_input_overlay_frame_from_status_frame(
 #[cfg(target_os = "macos")]
 fn tray_input_overlay_window_level() -> objc2_app_kit::NSWindowLevel {
     objc2_app_kit::NSScreenSaverWindowLevel + 1
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn accept_indirect_touch_events(view: &objc2_app_kit::NSView) {
+    view.setAcceptsTouchEvents(true);
+    view.setWantsRestingTouches(true);
+    view.setAllowedTouchTypes(objc2_app_kit::NSTouchTypeMask::Indirect);
 }
 
 #[cfg(target_os = "macos")]
