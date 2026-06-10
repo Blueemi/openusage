@@ -843,6 +843,19 @@ objc2::define_class!(
             self.ivars().touch_context_menu_opened.set(false);
         }
 
+        #[unsafe(method(openContextMenuFromClickGesture:))]
+        fn open_context_menu_from_click_gesture(
+            &self,
+            recognizer: &objc2_app_kit::NSClickGestureRecognizer,
+        ) {
+            log::debug!(
+                "tray context menu: overlay click gesture button_mask={} touches={}",
+                recognizer.buttonMask(),
+                recognizer.numberOfTouchesRequired()
+            );
+            self.open_context_menu();
+        }
+
     }
 );
 
@@ -957,6 +970,7 @@ fn install_tray_input_overlay(
     overlay_ns_view.setAcceptsTouchEvents(true);
     overlay_ns_view.setWantsRestingTouches(true);
     overlay_ns_view.setAllowedTouchTypes(objc2_app_kit::NSTouchTypeMask::Indirect);
+    install_tray_overlay_click_gestures(overlay_ns_view, &overlay_view);
     overlay_window.setContentView(Some(overlay_ns_view));
     overlay_window.orderFrontRegardless();
     log::debug!(
@@ -976,6 +990,60 @@ fn install_tray_input_overlay(
 
     std::mem::forget(overlay_window);
     std::mem::forget(overlay_view);
+}
+
+#[cfg(target_os = "macos")]
+fn install_tray_overlay_click_gestures(
+    view: &objc2_app_kit::NSView,
+    target: &TrayInputOverlayView,
+) {
+    use objc2::ClassType;
+    use objc2_app_kit::{NSClickGestureRecognizer, NSGestureRecognizer};
+
+    let Some(mtm) = objc2_foundation::MainThreadMarker::new() else {
+        log::warn!("tray context menu: cannot install click gestures off main thread");
+        return;
+    };
+    let target: &objc2::runtime::AnyObject =
+        unsafe { &*(target as *const TrayInputOverlayView).cast::<objc2::runtime::AnyObject>() };
+
+    let secondary_click = NSClickGestureRecognizer::new(mtm);
+    configure_tray_overlay_click_gesture(&secondary_click, target, 1 << 1, 1, false, true);
+    let secondary_click: &NSGestureRecognizer = secondary_click.as_super();
+    view.addGestureRecognizer(secondary_click);
+
+    let two_touch_click = NSClickGestureRecognizer::new(mtm);
+    configure_tray_overlay_click_gesture(&two_touch_click, target, 1 << 0, 2, true, false);
+    let two_touch_click: &NSGestureRecognizer = two_touch_click.as_super();
+    view.addGestureRecognizer(two_touch_click);
+
+    log::debug!("tray context menu: installed overlay click gestures");
+}
+
+#[cfg(target_os = "macos")]
+fn configure_tray_overlay_click_gesture(
+    recognizer: &objc2_app_kit::NSClickGestureRecognizer,
+    target: &objc2::runtime::AnyObject,
+    button_mask: objc2_foundation::NSUInteger,
+    touch_count: objc2_foundation::NSInteger,
+    delay_primary: bool,
+    delay_secondary: bool,
+) {
+    use objc2::ClassType;
+    use objc2_app_kit::NSGestureRecognizer;
+
+    recognizer.setButtonMask(button_mask);
+    recognizer.setNumberOfClicksRequired(1);
+    recognizer.setNumberOfTouchesRequired(touch_count);
+
+    let gesture: &NSGestureRecognizer = recognizer.as_super();
+    unsafe {
+        gesture.setTarget(Some(target));
+        gesture.setAction(Some(objc2::sel!(openContextMenuFromClickGesture:)));
+    }
+    gesture.setDelaysPrimaryMouseButtonEvents(delay_primary);
+    gesture.setDelaysSecondaryMouseButtonEvents(delay_secondary);
+    gesture.setDelaysOtherMouseButtonEvents(false);
 }
 
 #[cfg(target_os = "macos")]
