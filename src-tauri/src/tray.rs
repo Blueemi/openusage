@@ -11,7 +11,7 @@ use crate::log_path;
 use crate::panel::{get_or_init_panel, position_panel_at_tray_icon, show_panel, toggle_panel};
 
 #[cfg(target_os = "macos")]
-use objc2::{DefinedClass as _, Message as _};
+use objc2::Message as _;
 
 const LOG_LEVEL_STORE_KEY: &str = "logLevel";
 
@@ -333,15 +333,13 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         let global_status_item = status_item.retain();
         let button_view: &NSView = button.as_super().as_super().as_super();
         remove_status_item_overlay_subviews(button_view);
+        install_native_status_button(&button, app_handle.clone(), ns_menu);
         set_context_menu_on_view_tree(button_view, ns_menu);
-        let status_mouse_target =
-            TrayStatusMouseTarget::new(app_handle.clone(), ns_menu, &status_item);
-        install_status_mouse_target_view(button_view, &status_mouse_target);
+        update_native_tray_rect_from_view(button_view);
 
         let Some(window) = button.window() else {
             log::warn!("tray context menu: status item window unavailable");
             std::mem::forget(menu);
-            std::mem::forget(status_mouse_target);
             return;
         };
 
@@ -413,7 +411,6 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
 
         // NSMenu keeps a weak delegate; keep all native monitor state alive.
         std::mem::forget(menu);
-        std::mem::forget(status_mouse_target);
         std::mem::forget(block);
         std::mem::forget(global_block);
     }) {
@@ -423,21 +420,19 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
 
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
-struct TrayStatusMouseTargetIvars {
+struct NativeStatusButtonState {
     app_handle: AppHandle,
-    menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
-    status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
-    suppress_next_mouse_up: std::cell::Cell<bool>,
+    menu_ptr: usize,
+    suppress_next_mouse_up: bool,
 }
 
 #[cfg(target_os = "macos")]
 objc2::define_class!(
-    #[unsafe(super(objc2_app_kit::NSView))]
-    #[name = "OpenUsageTrayStatusMouseTarget"]
-    #[ivars = TrayStatusMouseTargetIvars]
-    struct TrayStatusMouseTarget;
+    #[unsafe(super(objc2_app_kit::NSStatusBarButton))]
+    #[name = "OpenUsageNativeTrayStatusButton"]
+    struct NativeTrayStatusButton;
 
-    impl TrayStatusMouseTarget {
+    impl NativeTrayStatusButton {
         #[unsafe(method(acceptsFirstMouse:))]
         fn accepts_first_mouse(&self, _event: Option<&objc2_app_kit::NSEvent>) -> bool {
             true
@@ -445,10 +440,11 @@ objc2::define_class!(
 
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &objc2_app_kit::NSEvent) {
+            self.update_tray_rect();
             if should_open_tray_menu_from_native_event(event)
                 || should_open_tray_menu_from_mouse_button_number(event.buttonNumber())
             {
-                self.ivars().suppress_next_mouse_up.set(true);
+                self.set_suppress_next_mouse_up(true);
                 self.open_context_menu(event);
                 return;
             }
@@ -458,88 +454,226 @@ objc2::define_class!(
 
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, _event: &objc2_app_kit::NSEvent) {
+            self.update_tray_rect();
             self.set_button_highlighted(false);
-            if self.ivars().suppress_next_mouse_up.replace(false) {
+            if self.take_suppress_next_mouse_up() {
                 return;
             }
-            toggle_panel(&self.ivars().app_handle);
+            if let Some(app_handle) = self.app_handle() {
+                toggle_panel(&app_handle);
+            }
         }
 
         #[unsafe(method(rightMouseDown:))]
         fn right_mouse_down(&self, event: &objc2_app_kit::NSEvent) {
+            self.set_suppress_next_mouse_up(true);
             self.open_context_menu(event);
+        }
+
+        #[unsafe(method(rightMouseUp:))]
+        fn right_mouse_up(&self, _event: &objc2_app_kit::NSEvent) {
+            self.set_suppress_next_mouse_up(false);
+            self.set_button_highlighted(false);
         }
 
         #[unsafe(method(otherMouseDown:))]
         fn other_mouse_down(&self, event: &objc2_app_kit::NSEvent) {
+            self.set_suppress_next_mouse_up(true);
             self.open_context_menu(event);
+        }
+
+        #[unsafe(method(otherMouseUp:))]
+        fn other_mouse_up(&self, _event: &objc2_app_kit::NSEvent) {
+            self.set_suppress_next_mouse_up(false);
+            self.set_button_highlighted(false);
         }
 
     }
 );
 
 #[cfg(target_os = "macos")]
-impl TrayStatusMouseTarget {
-    fn new(
-        app_handle: AppHandle,
-        menu: &objc2_app_kit::NSMenu,
-        status_item: &objc2_app_kit::NSStatusItem,
-    ) -> objc2::rc::Retained<Self> {
-        let mtm = objc2_foundation::MainThreadMarker::new().expect("main thread");
-        let target = mtm.alloc().set_ivars(TrayStatusMouseTargetIvars {
-            app_handle,
-            menu: menu.retain(),
-            status_item: status_item.retain(),
-            suppress_next_mouse_up: std::cell::Cell::new(false),
-        });
-        unsafe {
-            objc2::msg_send![
-                super(target),
-                initWithFrame: objc2_foundation::NSRect::new(
-                    objc2_foundation::NSPoint::new(0.0, 0.0),
-                    objc2_foundation::NSSize::new(0.0, 0.0)
-                )
-            ]
-        }
+impl NativeTrayStatusButton {
+    fn as_status_button(&self) -> &objc2_app_kit::NSStatusBarButton {
+        use objc2::ClassType;
+
+        self.as_super()
+    }
+
+    fn as_button(&self) -> &objc2_app_kit::NSButton {
+        use objc2::ClassType;
+
+        self.as_status_button().as_super()
+    }
+
+    fn as_view(&self) -> &objc2_app_kit::NSView {
+        use objc2::ClassType;
+
+        self.as_button().as_super().as_super()
     }
 
     fn open_context_menu(&self, event: &objc2_app_kit::NSEvent) {
-        use objc2::ClassType;
-
+        self.update_tray_rect();
+        self.set_button_highlighted(false);
         if should_skip_recent_native_menu_open(std::time::Instant::now()) {
             return;
         }
 
-        let view: &objc2_app_kit::NSView = self.as_super();
-        objc2_app_kit::NSMenu::popUpContextMenu_withEvent_forView(&self.ivars().menu, event, view);
+        let Some(menu_ptr) = self.menu_ptr() else {
+            return;
+        };
+        let menu = unsafe { &*(menu_ptr as *const objc2_app_kit::NSMenu) };
+        objc2_app_kit::NSMenu::popUpContextMenu_withEvent_forView(menu, event, self.as_view());
     }
 
     fn set_button_highlighted(&self, highlighted: bool) {
-        let mtm = objc2_foundation::MainThreadMarker::new().expect("main thread");
-        if let Some(button) = self.ivars().status_item.button(mtm) {
-            button.highlight(highlighted);
-        }
+        self.as_button().highlight(highlighted);
+    }
+
+    fn update_tray_rect(&self) {
+        update_native_tray_rect_from_view(self.as_view());
+    }
+
+    fn key(&self) -> usize {
+        self.as_status_button() as *const objc2_app_kit::NSStatusBarButton as usize
+    }
+
+    fn app_handle(&self) -> Option<AppHandle> {
+        with_native_status_button_state(self.key(), |state| state.app_handle.clone())
+    }
+
+    fn menu_ptr(&self) -> Option<usize> {
+        with_native_status_button_state(self.key(), |state| state.menu_ptr)
+    }
+
+    fn set_suppress_next_mouse_up(&self, value: bool) {
+        let _ = with_native_status_button_state(self.key(), |state| {
+            state.suppress_next_mouse_up = value;
+        });
+    }
+
+    fn take_suppress_next_mouse_up(&self) -> bool {
+        with_native_status_button_state(self.key(), |state| {
+            let value = state.suppress_next_mouse_up;
+            state.suppress_next_mouse_up = false;
+            value
+        })
+        .unwrap_or(false)
     }
 }
 
 #[cfg(target_os = "macos")]
-fn install_status_mouse_target_view(
-    button_view: &objc2_app_kit::NSView,
-    target: &TrayStatusMouseTarget,
+fn install_native_status_button(
+    button: &objc2_app_kit::NSStatusBarButton,
+    app_handle: AppHandle,
+    menu: &objc2_app_kit::NSMenu,
 ) {
     use objc2::ClassType;
 
-    let target_view: &objc2_app_kit::NSView = target.as_super();
-    target_view.setFrame(button_view.bounds());
-    target_view.setAutoresizingMask(status_mouse_target_autoresizing_mask());
-    button_view.addSubview(target_view);
+    let key = button as *const objc2_app_kit::NSStatusBarButton as usize;
+    let menu_ptr = objc2::rc::Retained::into_raw(menu.retain()) as usize;
+    if let Ok(mut states) = native_status_button_states().lock() {
+        states.insert(
+            key,
+            NativeStatusButtonState {
+                app_handle,
+                menu_ptr,
+                suppress_next_mouse_up: false,
+            },
+        );
+    }
+
+    unsafe {
+        object_setClass(
+            (button as *const objc2_app_kit::NSStatusBarButton)
+                .cast_mut()
+                .cast(),
+            NativeTrayStatusButton::class() as *const objc2::runtime::AnyClass,
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn status_mouse_target_autoresizing_mask() -> objc2_app_kit::NSAutoresizingMaskOptions {
-    use objc2_app_kit::NSAutoresizingMaskOptions;
+fn native_status_button_states(
+) -> &'static std::sync::Mutex<std::collections::HashMap<usize, NativeStatusButtonState>> {
+    static STATES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<usize, NativeStatusButtonState>>,
+    > = std::sync::OnceLock::new();
 
-    NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable
+    STATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(target_os = "macos")]
+fn with_native_status_button_state<R>(
+    key: usize,
+    f: impl FnOnce(&mut NativeStatusButtonState) -> R,
+) -> Option<R> {
+    native_status_button_states()
+        .lock()
+        .ok()
+        .and_then(|mut states| states.get_mut(&key).map(f))
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn object_setClass(
+        obj: *mut objc2::runtime::NSObject,
+        cls: *const objc2::runtime::AnyClass,
+    ) -> *const objc2::runtime::AnyClass;
+}
+
+#[cfg(target_os = "macos")]
+fn update_native_tray_rect_from_view(view: &objc2_app_kit::NSView) {
+    let Some(window) = view.window() else {
+        return;
+    };
+
+    update_native_tray_rect_from_window(&window);
+}
+
+#[cfg(target_os = "macos")]
+fn update_native_tray_rect_from_window(window: &objc2_app_kit::NSWindow) {
+    let mtm = objc2_foundation::MainThreadMarker::new().expect("main thread");
+    let main_screen_height = objc2_app_kit::NSScreen::mainScreen(mtm)
+        .map(|screen| screen.frame().size.height)
+        .unwrap_or_else(|| {
+            let frame = window.frame();
+            frame.origin.y + frame.size.height
+        });
+    let (position, size) = native_tray_rect_from_status_window_frame(
+        window.frame(),
+        window.backingScaleFactor(),
+        main_screen_height,
+    );
+    crate::panel::set_native_tray_rect(position, size);
+}
+
+#[cfg(target_os = "macos")]
+fn native_tray_rect_from_status_window_frame(
+    frame: objc2_foundation::NSRect,
+    scale_factor: f64,
+    main_screen_height: f64,
+) -> (tauri::Position, tauri::Size) {
+    let scale_factor = scale_factor.max(1.0);
+    let physical_x = round_to_i32(frame.origin.x * scale_factor);
+    let physical_y =
+        round_to_i32((main_screen_height - frame.origin.y - frame.size.height) * scale_factor);
+    let physical_w = round_to_u32(frame.size.width * scale_factor);
+    let physical_h = round_to_u32(frame.size.height * scale_factor);
+
+    (
+        tauri::Position::Physical(tauri::PhysicalPosition::new(physical_x, physical_y)),
+        tauri::Size::Physical(tauri::PhysicalSize::new(physical_w, physical_h)),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn round_to_i32(value: f64) -> i32 {
+    value.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32
+}
+
+#[cfg(target_os = "macos")]
+fn round_to_u32(value: f64) -> u32 {
+    value.round().clamp(1.0, u32::MAX as f64) as u32
 }
 
 #[cfg(target_os = "macos")]
@@ -918,6 +1052,27 @@ mod tests {
             rect,
             3.0
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_status_window_frame_converts_to_physical_tray_rect() {
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+        let frame = NSRect::new(NSPoint::new(100.0, 978.0), NSSize::new(24.0, 22.0));
+        let (position, size) = native_tray_rect_from_status_window_frame(frame, 2.0, 1000.0);
+
+        let tauri::Position::Physical(position) = position else {
+            panic!("expected physical position");
+        };
+        let tauri::Size::Physical(size) = size else {
+            panic!("expected physical size");
+        };
+
+        assert_eq!(position.x, 200);
+        assert_eq!(position.y, 0);
+        assert_eq!(size.width, 48);
+        assert_eq!(size.height, 44);
     }
 
     #[cfg(target_os = "macos")]

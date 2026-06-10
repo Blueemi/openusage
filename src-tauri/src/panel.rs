@@ -1,7 +1,22 @@
 use tauri::{AppHandle, Manager, Position, Size};
 use tauri_nspanel::{
-    CollectionBehavior, ManagerExt, PanelLevel, StyleMask, WebviewWindowExt, tauri_panel,
+    tauri_panel, CollectionBehavior, ManagerExt, PanelLevel, StyleMask, WebviewWindowExt,
 };
+
+#[cfg(target_os = "macos")]
+static NATIVE_TRAY_RECT: std::sync::Mutex<Option<(Position, Size)>> = std::sync::Mutex::new(None);
+
+#[cfg(target_os = "macos")]
+pub fn set_native_tray_rect(position: Position, size: Size) {
+    if let Ok(mut rect) = NATIVE_TRAY_RECT.lock() {
+        *rect = Some((position, size));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn native_tray_rect() -> Option<(Position, Size)> {
+    NATIVE_TRAY_RECT.lock().ok().and_then(|rect| *rect)
+}
 
 fn monitor_contains_physical_point(
     origin_x: f64,
@@ -91,19 +106,32 @@ pub(crate) use get_or_init_panel;
 /// Retrieve the tray icon rect and position the panel beneath it.
 /// No-ops gracefully if the tray icon or its rect is unavailable.
 fn position_panel_from_tray(app_handle: &AppHandle) {
-    let Some(tray) = app_handle.tray_by_id("tray") else {
-        log::debug!("position_panel_from_tray: tray icon not found");
+    #[cfg(target_os = "macos")]
+    {
+        if let Some((position, size)) = native_tray_rect() {
+            position_panel_at_tray_icon(app_handle, position, size);
+        } else {
+            log::debug!("position_panel_from_tray: native tray rect not available yet");
+        }
         return;
-    };
-    match tray.rect() {
-        Ok(Some(rect)) => {
-            position_panel_at_tray_icon(app_handle, rect.position, rect.size);
-        }
-        Ok(None) => {
-            log::debug!("position_panel_from_tray: tray rect not available yet");
-        }
-        Err(e) => {
-            log::warn!("position_panel_from_tray: failed to get tray rect: {}", e);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let Some(tray) = app_handle.tray_by_id("tray") else {
+            log::debug!("position_panel_from_tray: tray icon not found");
+            return;
+        };
+        match tray.rect() {
+            Ok(Some(rect)) => {
+                position_panel_at_tray_icon(app_handle, rect.position, rect.size);
+            }
+            Ok(None) => {
+                log::debug!("position_panel_from_tray: tray rect not available yet");
+            }
+            Err(e) => {
+                log::warn!("position_panel_from_tray: failed to get tray rect: {}", e);
+            }
         }
     }
 }
