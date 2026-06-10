@@ -808,15 +808,29 @@ fn should_open_tray_menu_from_cg_event(
     event_type: objc2_core_graphics::CGEventType,
     event: &objc2_core_graphics::CGEvent,
 ) -> bool {
-    use objc2_core_graphics::CGEvent;
+    use objc2_core_graphics::{CGEvent, CGEventField};
 
-    should_open_tray_menu_from_cg_event_type(event_type, CGEvent::flags(Some(event)))
+    should_open_tray_menu_from_cg_event_details(
+        event_type,
+        CGEvent::flags(Some(event)),
+        CGEvent::integer_value_field(Some(event), CGEventField::MouseEventButtonNumber),
+    )
 }
 
 #[cfg(target_os = "macos")]
+#[cfg(test)]
 fn should_open_tray_menu_from_cg_event_type(
     event_type: objc2_core_graphics::CGEventType,
     flags: objc2_core_graphics::CGEventFlags,
+) -> bool {
+    should_open_tray_menu_from_cg_event_details(event_type, flags, 0)
+}
+
+#[cfg(target_os = "macos")]
+fn should_open_tray_menu_from_cg_event_details(
+    event_type: objc2_core_graphics::CGEventType,
+    flags: objc2_core_graphics::CGEventFlags,
+    button_number: i64,
 ) -> bool {
     use objc2_core_graphics::{CGEventFlags, CGEventType};
 
@@ -825,7 +839,7 @@ fn should_open_tray_menu_from_cg_event_type(
         || event_type == CGEventType::OtherMouseDown
         || event_type == CGEventType::OtherMouseUp
         || ((event_type == CGEventType::LeftMouseDown || event_type == CGEventType::LeftMouseUp)
-            && flags.contains(CGEventFlags::MaskControl))
+            && (flags.contains(CGEventFlags::MaskControl) || button_number == 1))
 }
 
 #[cfg(target_os = "macos")]
@@ -968,17 +982,30 @@ fn is_point_inside_rect_with_padding(
 
 #[cfg(target_os = "macos")]
 fn should_open_tray_menu_from_native_event(event: &objc2_app_kit::NSEvent) -> bool {
-    should_open_tray_menu_from_native_event_type(event.r#type(), event.modifierFlags())
-        || should_open_tray_menu_from_trackpad_event_type(
-            event.r#type(),
-            objc2_app_kit::NSEvent::pressedMouseButtons() as usize,
-        )
+    should_open_tray_menu_from_native_event_details(
+        event.r#type(),
+        event.modifierFlags(),
+        event.buttonNumber(),
+    ) || should_open_tray_menu_from_trackpad_event_type(
+        event.r#type(),
+        objc2_app_kit::NSEvent::pressedMouseButtons() as usize,
+    )
 }
 
 #[cfg(target_os = "macos")]
+#[cfg(test)]
 fn should_open_tray_menu_from_native_event_type(
     event_type: objc2_app_kit::NSEventType,
     modifier_flags: objc2_app_kit::NSEventModifierFlags,
+) -> bool {
+    should_open_tray_menu_from_native_event_details(event_type, modifier_flags, 0)
+}
+
+#[cfg(target_os = "macos")]
+fn should_open_tray_menu_from_native_event_details(
+    event_type: objc2_app_kit::NSEventType,
+    modifier_flags: objc2_app_kit::NSEventModifierFlags,
+    button_number: isize,
 ) -> bool {
     use objc2_app_kit::{NSEventModifierFlags, NSEventType};
 
@@ -993,9 +1020,9 @@ fn should_open_tray_menu_from_native_event_type(
         || event_type == NSEventType::Pressure
         || event_type == NSEventType::DirectTouch
         || (event_type == NSEventType::LeftMouseDown
-            && modifier_flags.contains(NSEventModifierFlags::Control))
+            && (modifier_flags.contains(NSEventModifierFlags::Control) || button_number == 1))
         || (event_type == NSEventType::LeftMouseUp
-            && modifier_flags.contains(NSEventModifierFlags::Control))
+            && (modifier_flags.contains(NSEventModifierFlags::Control) || button_number == 1))
 }
 
 #[cfg(target_os = "macos")]
@@ -1152,6 +1179,16 @@ mod tests {
             NSEventType::LeftMouseUp,
             NSEventModifierFlags::Control
         ));
+        assert!(should_open_tray_menu_from_native_event_details(
+            NSEventType::LeftMouseDown,
+            NSEventModifierFlags::empty(),
+            1
+        ));
+        assert!(should_open_tray_menu_from_native_event_details(
+            NSEventType::LeftMouseUp,
+            NSEventModifierFlags::empty(),
+            1
+        ));
         assert!(!should_open_tray_menu_from_native_event_type(
             NSEventType::LeftMouseDown,
             NSEventModifierFlags::empty()
@@ -1298,6 +1335,16 @@ mod tests {
         assert!(should_open_tray_menu_from_cg_event_type(
             CGEventType::LeftMouseUp,
             CGEventFlags::MaskControl
+        ));
+        assert!(should_open_tray_menu_from_cg_event_details(
+            CGEventType::LeftMouseDown,
+            CGEventFlags::empty(),
+            1
+        ));
+        assert!(should_open_tray_menu_from_cg_event_details(
+            CGEventType::LeftMouseUp,
+            CGEventFlags::empty(),
+            1
         ));
         assert!(!should_open_tray_menu_from_cg_event_type(
             CGEventType::LeftMouseUp,
