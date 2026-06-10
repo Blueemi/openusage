@@ -10,6 +10,9 @@ use tauri_plugin_store::StoreExt;
 use crate::log_path;
 use crate::panel::{get_or_init_panel, position_panel_at_tray_icon, show_panel};
 
+#[cfg(target_os = "macos")]
+use objc2::{DefinedClass as _, MainThreadOnly as _, Message as _};
+
 const LOG_LEVEL_STORE_KEY: &str = "logLevel";
 
 fn should_open_tray_menu(button: MouseButton, button_state: MouseButtonState) -> bool {
@@ -328,10 +331,13 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         let global_ns_menu = ns_menu.retain();
         let button_view: &NSView = button.as_super().as_super().as_super();
         set_context_menu_on_view_tree(button_view, ns_menu);
+        let gesture_target = TrayMenuGestureTarget::new(ns_menu);
+        attach_secondary_click_recognizers(button_view, &gesture_target);
 
         let Some(window) = button.window() else {
             log::warn!("tray context menu: status item window unavailable");
             std::mem::forget(menu);
+            std::mem::forget(gesture_target);
             return;
         };
 
@@ -401,6 +407,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
 
         // NSMenu keeps a weak delegate; keep all native monitor state alive.
         std::mem::forget(menu);
+        std::mem::forget(gesture_target);
         std::mem::forget(block);
         std::mem::forget(global_block);
     }) {
@@ -409,10 +416,86 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
 }
 
 #[cfg(target_os = "macos")]
-fn set_context_menu_on_view_tree(
+#[derive(Debug)]
+struct TrayMenuGestureTargetIvars {
+    menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
+    last_opened_at: std::cell::Cell<std::time::Instant>,
+}
+
+#[cfg(target_os = "macos")]
+objc2::define_class!(
+    #[unsafe(super(objc2_foundation::NSObject))]
+    #[name = "OpenUsageTrayMenuGestureTarget"]
+    #[ivars = TrayMenuGestureTargetIvars]
+    struct TrayMenuGestureTarget;
+
+    impl TrayMenuGestureTarget {
+        #[unsafe(method(openTrayMenu:))]
+        fn open_tray_menu(&self, _sender: &objc2_app_kit::NSClickGestureRecognizer) {
+            let now = std::time::Instant::now();
+            let last_opened_at = self.ivars().last_opened_at.get();
+            if now.duration_since(last_opened_at) < std::time::Duration::from_millis(200) {
+                return;
+            }
+            self.ivars().last_opened_at.set(now);
+            show_native_tray_menu(&self.ivars().menu);
+        }
+    }
+);
+
+#[cfg(target_os = "macos")]
+impl TrayMenuGestureTarget {
+    fn new(menu: &objc2_app_kit::NSMenu) -> objc2::rc::Retained<Self> {
+        let mtm = objc2_foundation::MainThreadMarker::new().expect("main thread");
+        let target = mtm.alloc().set_ivars(TrayMenuGestureTargetIvars {
+            menu: menu.retain(),
+            last_opened_at: std::cell::Cell::new(
+                std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .unwrap_or_else(std::time::Instant::now),
+            ),
+        });
+        unsafe { objc2::msg_send![super(target), init] }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn attach_secondary_click_recognizers(
     view: &objc2_app_kit::NSView,
-    menu: &objc2_app_kit::NSMenu,
+    target: &TrayMenuGestureTarget,
 ) {
+    use objc2::ClassType;
+    use objc2_app_kit::{NSClickGestureRecognizer, NSGestureRecognizer};
+
+    unsafe {
+        let recognizer = NSClickGestureRecognizer::initWithTarget_action(
+            NSClickGestureRecognizer::alloc(
+                objc2_foundation::MainThreadMarker::new().expect("main thread"),
+            ),
+            Some(target.as_super().as_super()),
+            Some(objc2::sel!(openTrayMenu:)),
+        );
+        recognizer.setButtonMask(secondary_click_button_mask());
+        recognizer.setNumberOfClicksRequired(1);
+        recognizer.setDelaysPrimaryMouseButtonEvents(false);
+        recognizer.setDelaysSecondaryMouseButtonEvents(false);
+
+        let recognizer: &NSGestureRecognizer = recognizer.as_super();
+        view.addGestureRecognizer(recognizer);
+    }
+
+    for subview in view.subviews() {
+        attach_secondary_click_recognizers(&subview, target);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn secondary_click_button_mask() -> objc2_foundation::NSUInteger {
+    (1usize << 1) as objc2_foundation::NSUInteger
+}
+
+#[cfg(target_os = "macos")]
+fn set_context_menu_on_view_tree(view: &objc2_app_kit::NSView, menu: &objc2_app_kit::NSMenu) {
     use objc2::ClassType;
     use objc2_app_kit::NSResponder;
 
@@ -635,5 +718,11 @@ mod tests {
             rect,
             3.0
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn secondary_click_gesture_uses_right_button_mask() {
+        assert_eq!(secondary_click_button_mask(), 2);
     }
 }
