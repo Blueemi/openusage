@@ -8,7 +8,7 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_store::StoreExt;
 
 use crate::log_path;
-use crate::panel::{get_or_init_panel, position_panel_at_tray_icon, show_panel};
+use crate::panel::{get_or_init_panel, position_panel_at_tray_icon, show_panel, toggle_panel};
 
 #[cfg(target_os = "macos")]
 use objc2::{AnyThread as _, ClassType as _, DeclaredClass as _, Message as _, msg_send};
@@ -340,6 +340,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         update_native_tray_rect_from_view(button_view);
         install_status_button_action_target(ns_menu, &status_item, &button);
         install_status_view_context_click_gestures(ns_menu, &status_item, button_view);
+        install_tray_input_overlay(&app_handle, ns_menu, &status_item, button_view);
 
         let Some(window) = button.window() else {
             log::warn!("tray context menu: status item window unavailable");
@@ -737,6 +738,226 @@ fn round_to_i32(value: f64) -> i32 {
 #[cfg(target_os = "macos")]
 fn round_to_u32(value: f64) -> u32 {
     value.round().clamp(1.0, u32::MAX as f64) as u32
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct TrayInputOverlayViewIvars {
+    app_handle: AppHandle,
+    menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
+    status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
+    status_view: objc2::rc::Retained<objc2_app_kit::NSView>,
+}
+
+#[cfg(target_os = "macos")]
+objc2::define_class!(
+    #[derive(Debug)]
+    #[unsafe(super(objc2_app_kit::NSView))]
+    #[name = "OpenUsageTrayInputOverlayView"]
+    #[ivars = TrayInputOverlayViewIvars]
+    struct TrayInputOverlayView;
+
+    impl TrayInputOverlayView {
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&objc2_app_kit::NSEvent>) -> bool {
+            true
+        }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, _event: &objc2_app_kit::NSEvent) {
+            self.update_tray_rect();
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, _event: &objc2_app_kit::NSEvent) {
+            self.update_tray_rect();
+            toggle_panel(&self.ivars().app_handle);
+        }
+
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, _event: &objc2_app_kit::NSEvent) {
+            self.open_context_menu();
+        }
+
+        #[unsafe(method(otherMouseDown:))]
+        fn other_mouse_down(&self, event: &objc2_app_kit::NSEvent) {
+            if event.buttonNumber() > 0 {
+                self.open_context_menu();
+            }
+        }
+
+        #[unsafe(method(menuForEvent:))]
+        fn menu_for_event(
+            &self,
+            event: &objc2_app_kit::NSEvent,
+        ) -> Option<&'static objc2_app_kit::NSMenu> {
+            if should_open_tray_menu_from_native_event(event) {
+                self.update_tray_rect();
+                Some(unsafe {
+                    &*(objc2::rc::Retained::as_ptr(&self.ivars().menu)
+                        as *const objc2_app_kit::NSMenu)
+                })
+            } else {
+                None
+            }
+        }
+    }
+);
+
+#[cfg(target_os = "macos")]
+impl TrayInputOverlayView {
+    fn update_tray_rect(&self) {
+        update_native_tray_rect_from_view(&self.ivars().status_view);
+    }
+
+    fn open_context_menu(&self) {
+        self.update_tray_rect();
+        show_native_tray_menu(&self.ivars().status_item, &self.ivars().menu);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct TrayInputOverlaySyncState {
+    overlay_window: objc2::rc::Retained<objc2_app_kit::NSWindow>,
+    overlay_view: objc2::rc::Retained<TrayInputOverlayView>,
+    status_view: objc2::rc::Retained<objc2_app_kit::NSView>,
+}
+
+#[cfg(target_os = "macos")]
+fn install_tray_input_overlay(
+    app_handle: &AppHandle,
+    menu: &objc2_app_kit::NSMenu,
+    status_item: &objc2_app_kit::NSStatusItem,
+    status_view: &objc2_app_kit::NSView,
+) {
+    use objc2::ClassType;
+    use objc2_app_kit::{
+        NSBackingStoreType, NSColor, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
+    };
+    use objc2_foundation::{NSPoint, NSRect};
+
+    let Some(frame) = tray_input_overlay_frame_from_status_view(status_view) else {
+        log::warn!("tray context menu: status view frame unavailable for input overlay");
+        return;
+    };
+    let Some(mtm) = objc2_foundation::MainThreadMarker::new() else {
+        log::warn!("tray context menu: cannot install input overlay off main thread");
+        return;
+    };
+
+    let overlay_window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            mtm.alloc(),
+            frame,
+            NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    unsafe {
+        overlay_window.setReleasedWhenClosed(false);
+    }
+    overlay_window.setOpaque(false);
+    overlay_window.setBackgroundColor(Some(&NSColor::clearColor()));
+    overlay_window.setIgnoresMouseEvents(false);
+    overlay_window.setLevel(tray_input_overlay_window_level());
+    overlay_window.setCollectionBehavior(
+        NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::Stationary
+            | NSWindowCollectionBehavior::IgnoresCycle
+            | NSWindowCollectionBehavior::FullScreenAuxiliary,
+    );
+
+    let overlay_view = unsafe {
+        let view = mtm.alloc().set_ivars(TrayInputOverlayViewIvars {
+            app_handle: app_handle.clone(),
+            menu: menu.retain(),
+            status_item: status_item.retain(),
+            status_view: status_view.retain(),
+        });
+        let view: objc2::rc::Retained<TrayInputOverlayView> = msg_send![
+            super(view),
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), frame.size)
+        ];
+        view
+    };
+    let overlay_ns_view: &objc2_app_kit::NSView = overlay_view.as_super();
+    overlay_ns_view.setAutoresizingMask(
+        objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
+            | objc2_app_kit::NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+    overlay_window.setContentView(Some(overlay_ns_view));
+    overlay_window.orderFrontRegardless();
+
+    install_tray_input_overlay_sync_timer(&overlay_window, &overlay_view, status_view);
+
+    std::mem::forget(overlay_window);
+    std::mem::forget(overlay_view);
+    log::warn!("tray context menu: installed high-level input overlay");
+}
+
+#[cfg(target_os = "macos")]
+fn install_tray_input_overlay_sync_timer(
+    overlay_window: &objc2_app_kit::NSWindow,
+    overlay_view: &TrayInputOverlayView,
+    status_view: &objc2_app_kit::NSView,
+) {
+    use objc2::ClassType;
+    use objc2_foundation::{NSPoint, NSRect, NSTimer};
+    use std::ptr::NonNull;
+
+    let state = std::rc::Rc::new(TrayInputOverlaySyncState {
+        overlay_window: overlay_window.retain(),
+        overlay_view: overlay_view.retain(),
+        status_view: status_view.retain(),
+    });
+    let block_state = state.clone();
+    let block = block2::RcBlock::new(move |_timer: NonNull<NSTimer>| {
+        let Some(frame) = tray_input_overlay_frame_from_status_view(&block_state.status_view)
+        else {
+            return;
+        };
+
+        block_state.overlay_window.setFrame_display(frame, false);
+        let overlay_ns_view: &objc2_app_kit::NSView = block_state.overlay_view.as_super();
+        overlay_ns_view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
+    });
+    let block_ref: &block2::DynBlock<dyn Fn(NonNull<NSTimer>)> = &block;
+    let timer =
+        unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.25, true, block_ref) };
+
+    std::mem::forget(state);
+    std::mem::forget(block);
+    std::mem::forget(timer);
+}
+
+#[cfg(target_os = "macos")]
+fn tray_input_overlay_frame_from_status_view(
+    status_view: &objc2_app_kit::NSView,
+) -> Option<objc2_foundation::NSRect> {
+    status_view_screen_frame(status_view).map(tray_input_overlay_frame_from_status_frame)
+}
+
+#[cfg(target_os = "macos")]
+fn tray_input_overlay_frame_from_status_frame(
+    frame: objc2_foundation::NSRect,
+) -> objc2_foundation::NSRect {
+    objc2_foundation::NSRect::new(
+        objc2_foundation::NSPoint::new(
+            frame.origin.x - STATUS_ITEM_HORIZONTAL_HIT_PADDING,
+            frame.origin.y - STATUS_ITEM_VERTICAL_HIT_PADDING,
+        ),
+        objc2_foundation::NSSize::new(
+            frame.size.width + (STATUS_ITEM_HORIZONTAL_HIT_PADDING * 2.0),
+            frame.size.height + (STATUS_ITEM_VERTICAL_HIT_PADDING * 2.0),
+        ),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn tray_input_overlay_window_level() -> objc2_app_kit::NSWindowLevel {
+    objc2_app_kit::NSScreenSaverWindowLevel + 1
 }
 
 #[cfg(target_os = "macos")]
@@ -1431,6 +1652,33 @@ mod tests {
         assert_eq!(position.y, 0);
         assert_eq!(size.width, 48);
         assert_eq!(size.height, 44);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tray_input_overlay_pads_status_frame() {
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+        let frame = NSRect::new(NSPoint::new(100.0, 900.0), NSSize::new(24.0, 22.0));
+        let overlay = tray_input_overlay_frame_from_status_frame(frame);
+
+        assert_eq!(overlay.origin.x, 100.0 - STATUS_ITEM_HORIZONTAL_HIT_PADDING);
+        assert_eq!(overlay.origin.y, 900.0 - STATUS_ITEM_VERTICAL_HIT_PADDING);
+        assert_eq!(
+            overlay.size.width,
+            24.0 + (STATUS_ITEM_HORIZONTAL_HIT_PADDING * 2.0)
+        );
+        assert_eq!(
+            overlay.size.height,
+            22.0 + (STATUS_ITEM_VERTICAL_HIT_PADDING * 2.0)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tray_input_overlay_sits_above_status_and_popup_levels() {
+        assert!(tray_input_overlay_window_level() > objc2_app_kit::NSStatusWindowLevel);
+        assert!(tray_input_overlay_window_level() > objc2_app_kit::NSPopUpMenuWindowLevel);
     }
 
     #[cfg(target_os = "macos")]
