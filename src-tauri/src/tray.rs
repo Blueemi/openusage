@@ -505,24 +505,6 @@ objc2::define_class!(
             self.set_button_highlighted(false);
         }
 
-        #[unsafe(method(menuForEvent:))]
-        fn menu_for_event(
-            &self,
-            event: &objc2_app_kit::NSEvent,
-        ) -> Option<&'static objc2_app_kit::NSMenu> {
-            if should_return_context_menu_from_native_event(event) {
-                if should_skip_recent_native_menu_open(std::time::Instant::now()) {
-                    return None;
-                }
-                self.update_tray_rect();
-                self.set_suppress_next_mouse_up(true);
-                self.set_button_highlighted(false);
-                self.context_menu()
-            } else {
-                None
-            }
-        }
-
     }
 );
 
@@ -549,9 +531,6 @@ impl NativeTrayStatusButton {
     fn open_context_menu(&self, event: &objc2_app_kit::NSEvent) {
         self.update_tray_rect();
         self.set_button_highlighted(false);
-        if should_skip_recent_native_menu_open(std::time::Instant::now()) {
-            return;
-        }
 
         let Some(menu) = self.context_menu() else {
             return;
@@ -793,23 +772,6 @@ objc2::define_class!(
             }
         }
 
-        #[unsafe(method(menuForEvent:))]
-        fn menu_for_event(
-            &self,
-            event: &objc2_app_kit::NSEvent,
-        ) -> Option<&'static objc2_app_kit::NSMenu> {
-            if should_return_context_menu_from_native_event(event)
-                && !should_skip_recent_native_menu_open(std::time::Instant::now())
-            {
-                self.update_tray_rect();
-                Some(unsafe {
-                    &*(objc2::rc::Retained::as_ptr(&self.ivars().menu)
-                        as *const objc2_app_kit::NSMenu)
-                })
-            } else {
-                None
-            }
-        }
     }
 );
 
@@ -821,7 +783,7 @@ impl TrayInputOverlayView {
 
     fn open_context_menu(&self) {
         self.update_tray_rect();
-        show_native_tray_menu(&self.ivars().status_item, &self.ivars().menu);
+        show_native_tray_menu_without_recent_guard(&self.ivars().status_item, &self.ivars().menu);
     }
 }
 
@@ -1197,11 +1159,20 @@ fn set_context_menu_on_view_tree(view: &objc2_app_kit::NSView, menu: &objc2_app_
 #[cfg(target_os = "macos")]
 #[allow(deprecated)]
 fn show_native_tray_menu(status_item: &objc2_app_kit::NSStatusItem, menu: &objc2_app_kit::NSMenu) {
-    use objc2::ClassType;
-
     if should_skip_recent_native_menu_open(std::time::Instant::now()) {
         return;
     }
+
+    show_native_tray_menu_without_recent_guard(status_item, menu);
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn show_native_tray_menu_without_recent_guard(
+    status_item: &objc2_app_kit::NSStatusItem,
+    menu: &objc2_app_kit::NSMenu,
+) {
+    use objc2::ClassType;
 
     let Some(mtm) = objc2_foundation::MainThreadMarker::new() else {
         return;
@@ -1281,19 +1252,6 @@ fn should_open_tray_menu_from_native_event(event: &objc2_app_kit::NSEvent) -> bo
             event.r#type(),
             objc2_app_kit::NSEvent::pressedMouseButtons() as usize,
         )
-}
-
-#[cfg(target_os = "macos")]
-fn should_return_context_menu_from_native_event(event: &objc2_app_kit::NSEvent) -> bool {
-    should_return_context_menu_from_native_event_type(event.r#type(), event.modifierFlags())
-}
-
-#[cfg(target_os = "macos")]
-fn should_return_context_menu_from_native_event_type(
-    event_type: objc2_app_kit::NSEventType,
-    modifier_flags: objc2_app_kit::NSEventModifierFlags,
-) -> bool {
-    should_open_tray_menu_from_native_event_type(event_type, modifier_flags)
 }
 
 #[cfg(target_os = "macos")]
@@ -1473,29 +1431,6 @@ mod tests {
         ));
         assert!(!should_open_tray_menu_from_native_event_type(
             NSEventType::Gesture,
-            NSEventModifierFlags::empty()
-        ));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn native_context_menu_lookup_accepts_secondary_clicks() {
-        use objc2_app_kit::{NSEventModifierFlags, NSEventType};
-
-        assert!(should_return_context_menu_from_native_event_type(
-            NSEventType::RightMouseDown,
-            NSEventModifierFlags::empty()
-        ));
-        assert!(should_return_context_menu_from_native_event_type(
-            NSEventType::RightMouseUp,
-            NSEventModifierFlags::empty()
-        ));
-        assert!(should_return_context_menu_from_native_event_type(
-            NSEventType::LeftMouseUp,
-            NSEventModifierFlags::Control
-        ));
-        assert!(!should_return_context_menu_from_native_event_type(
-            NSEventType::LeftMouseUp,
             NSEventModifierFlags::empty()
         ));
     }
