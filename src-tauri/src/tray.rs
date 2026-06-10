@@ -305,7 +305,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
     if let Err(error) = tray.with_inner_tray_icon(move |inner| {
         use muda::ContextMenu as _;
         use objc2::{ClassType, Message};
-        use objc2_app_kit::{NSEvent, NSEventMask, NSMenu, NSView, NSWindow};
+        use objc2_app_kit::{NSEvent, NSEventMask, NSMenu, NSView};
         use objc2_foundation::MainThreadMarker;
         use std::cell::Cell;
         use std::ptr;
@@ -337,8 +337,6 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         status_item.setMenu(Some(ns_menu));
         let local_ns_menu = ns_menu.retain();
         let local_status_item = status_item.retain();
-        let global_ns_menu = ns_menu.retain();
-        let global_status_item = status_item.retain();
         let button_view: &NSView = button.as_super().as_super().as_super();
         remove_status_item_overlay_subviews(button_view);
         install_native_status_button(&button, &status_item, app_handle.clone(), ns_menu);
@@ -352,10 +350,12 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         };
 
         let status_window_number = window.windowNumber();
-        let status_window: objc2::rc::Retained<NSWindow> = window.clone();
-        install_tray_input_overlay(&app_handle, ns_menu, &status_item, &status_window);
-        install_status_item_event_tap(ns_menu, &status_item, &status_window);
-        install_secondary_click_poll_timer(ns_menu, &status_item, &status_window);
+        let global_ns_menu = ns_menu.retain();
+        let global_status_item = status_item.retain();
+        let global_status_view = button_view.retain();
+        install_tray_input_overlay(&app_handle, ns_menu, &status_item, button_view);
+        install_status_item_event_tap(ns_menu, &status_item, button_view);
+        install_secondary_click_poll_timer(ns_menu, &status_item, button_view);
 
         let last_event_number = Cell::new(-1);
         let block = block2::RcBlock::new(move |event_ptr: NonNull<NSEvent>| -> *mut NSEvent {
@@ -401,7 +401,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         let global_block = block2::RcBlock::new(move |event_ptr: NonNull<NSEvent>| {
             let event = unsafe { event_ptr.as_ref() };
             if !should_open_tray_menu_from_native_event(event)
-                || !is_mouse_inside_window(&status_window)
+                || !is_mouse_inside_status_view(&global_status_view)
             {
                 return;
             }
@@ -521,6 +521,39 @@ objc2::define_class!(
             self.set_button_highlighted(false);
         }
 
+        #[unsafe(method(openContextMenuFromClickGesture:))]
+        fn open_context_menu_from_click_gesture(
+            &self,
+            recognizer: &objc2_app_kit::NSClickGestureRecognizer,
+        ) {
+            log::debug!(
+                "tray context menu: status button click gesture button_mask={} touches={}",
+                recognizer.buttonMask(),
+                recognizer.numberOfTouchesRequired()
+            );
+            self.set_suppress_next_mouse_up(true);
+            self.open_context_menu_without_event();
+        }
+
+        #[unsafe(method(menuForEvent:))]
+        fn menu_for_event(
+            &self,
+            event: &objc2_app_kit::NSEvent,
+        ) -> Option<&'static objc2_app_kit::NSMenu> {
+            if should_open_tray_menu_from_native_event(event) {
+                log::debug!(
+                    "tray context menu: status button returning menu for event type={:?}",
+                    event.r#type()
+                );
+                self.update_tray_rect();
+                self.set_suppress_next_mouse_up(true);
+                self.set_button_highlighted(false);
+                self.context_menu()
+            } else {
+                None
+            }
+        }
+
     }
 );
 
@@ -555,6 +588,30 @@ impl NativeTrayStatusButton {
         log::debug!("tray context menu: status button opening native menu");
         if !pop_up_native_tray_menu_at_view(&menu, self.as_view()) {
             objc2_app_kit::NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self.as_view());
+        }
+    }
+
+    fn open_context_menu_without_event(&self) {
+        self.update_tray_rect();
+        self.set_button_highlighted(false);
+
+        let Some(menu) = self.context_menu() else {
+            log::warn!("tray context menu: status button menu missing");
+            return;
+        };
+        let Some(status_item) = self.status_item() else {
+            log::warn!("tray context menu: status item missing");
+            return;
+        };
+
+        log::debug!("tray context menu: status button gesture opening native menu");
+        if pop_up_native_tray_menu_at_view(&menu, self.as_view()) {
+            return;
+        }
+
+        #[allow(deprecated)]
+        {
+            status_item.popUpStatusItemMenu(&menu);
         }
     }
 
@@ -651,6 +708,12 @@ fn install_native_status_button(
             NativeTrayStatusButton::class() as *const objc2::runtime::AnyClass,
         );
     }
+
+    let target: &objc2::runtime::AnyObject = unsafe {
+        &*(button as *const objc2_app_kit::NSStatusBarButton).cast::<objc2::runtime::AnyObject>()
+    };
+    let view: &objc2_app_kit::NSView = button.as_super().as_super().as_super();
+    install_tray_click_gestures(view, target);
 }
 
 #[cfg(target_os = "macos")]
@@ -681,28 +744,36 @@ unsafe extern "C" {
 
 #[cfg(target_os = "macos")]
 fn update_native_tray_rect_from_view(view: &objc2_app_kit::NSView) {
-    let Some(window) = view.window() else {
+    let Some(screen_frame) = status_view_screen_frame(view) else {
         return;
     };
 
-    update_native_tray_rect_from_window(&window);
-}
-
-#[cfg(target_os = "macos")]
-fn update_native_tray_rect_from_window(window: &objc2_app_kit::NSWindow) {
+    let Some(window) = view.window() else {
+        return;
+    };
     let mtm = objc2_foundation::MainThreadMarker::new().expect("main thread");
     let main_screen_height = objc2_app_kit::NSScreen::mainScreen(mtm)
         .map(|screen| screen.frame().size.height)
         .unwrap_or_else(|| {
-            let frame = window.frame();
+            let frame = screen_frame;
             frame.origin.y + frame.size.height
         });
     let (position, size) = native_tray_rect_from_status_window_frame(
-        window.frame(),
+        screen_frame,
         window.backingScaleFactor(),
         main_screen_height,
     );
     crate::panel::set_native_tray_rect(position, size);
+}
+
+#[cfg(target_os = "macos")]
+fn status_view_screen_frame(view: &objc2_app_kit::NSView) -> Option<objc2_foundation::NSRect> {
+    let window = view.window()?;
+    let bounds = view.bounds();
+    let window_rect = view.convertRect_toView(bounds, None);
+    let screen_rect = window.convertRectToScreen(window_rect);
+
+    (screen_rect.size.width >= 1.0 && screen_rect.size.height >= 1.0).then_some(screen_rect)
 }
 
 #[cfg(target_os = "macos")]
@@ -763,7 +834,7 @@ fn remove_status_item_overlay_subviews(view: &objc2_app_kit::NSView) {
 struct TrayEventTapState {
     menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
     status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
-    window: objc2::rc::Retained<objc2_app_kit::NSWindow>,
+    status_view: objc2::rc::Retained<objc2_app_kit::NSView>,
 }
 
 #[cfg(target_os = "macos")]
@@ -772,7 +843,7 @@ struct TrayInputOverlayViewIvars {
     app_handle: AppHandle,
     menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
     status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
-    status_window: objc2::rc::Retained<objc2_app_kit::NSWindow>,
+    status_view: objc2::rc::Retained<objc2_app_kit::NSView>,
     touch_context_menu_opened: std::cell::Cell<bool>,
 }
 
@@ -856,18 +927,39 @@ objc2::define_class!(
             self.open_context_menu();
         }
 
+        #[unsafe(method(menuForEvent:))]
+        fn menu_for_event(
+            &self,
+            event: &objc2_app_kit::NSEvent,
+        ) -> Option<&'static objc2_app_kit::NSMenu> {
+            if should_open_tray_menu_from_native_event(event) {
+                log::debug!(
+                    "tray context menu: overlay returning menu for event type={:?}",
+                    event.r#type()
+                );
+                self.update_tray_rect();
+                Some(self.context_menu())
+            } else {
+                None
+            }
+        }
+
     }
 );
 
 #[cfg(target_os = "macos")]
 impl TrayInputOverlayView {
     fn update_tray_rect(&self) {
-        update_native_tray_rect_from_window(&self.ivars().status_window);
+        update_native_tray_rect_from_view(&self.ivars().status_view);
     }
 
     fn open_context_menu(&self) {
         self.update_tray_rect();
         show_native_tray_menu_without_recent_guard(&self.ivars().status_item, &self.ivars().menu);
+    }
+
+    fn context_menu(&self) -> &'static objc2_app_kit::NSMenu {
+        unsafe { &*(self.ivars().menu.as_ref() as *const objc2_app_kit::NSMenu) }
     }
 
     fn handle_touches(&self, event: &objc2_app_kit::NSEvent) {
@@ -901,7 +993,7 @@ impl TrayInputOverlayView {
 struct TrayInputOverlaySyncState {
     overlay_window: objc2::rc::Retained<objc2_app_kit::NSWindow>,
     overlay_view: objc2::rc::Retained<TrayInputOverlayView>,
-    status_window: objc2::rc::Retained<objc2_app_kit::NSWindow>,
+    status_view: objc2::rc::Retained<objc2_app_kit::NSView>,
 }
 
 #[cfg(target_os = "macos")]
@@ -909,7 +1001,7 @@ fn install_tray_input_overlay(
     app_handle: &AppHandle,
     menu: &objc2_app_kit::NSMenu,
     status_item: &objc2_app_kit::NSStatusItem,
-    status_window: &objc2_app_kit::NSWindow,
+    status_view: &objc2_app_kit::NSView,
 ) {
     use objc2::ClassType;
     use objc2_app_kit::{
@@ -918,7 +1010,10 @@ fn install_tray_input_overlay(
     };
     use objc2_foundation::{NSPoint, NSRect};
 
-    let frame = tray_input_overlay_frame_from_status_window_frame(status_window.frame());
+    let Some(frame) = tray_input_overlay_frame_from_status_view(status_view) else {
+        log::warn!("tray context menu: status button screen frame unavailable");
+        return;
+    };
     let overlay_window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
             objc2_foundation::MainThreadMarker::new()
@@ -952,7 +1047,7 @@ fn install_tray_input_overlay(
                 app_handle: app_handle.clone(),
                 menu: menu.retain(),
                 status_item: status_item.retain(),
-                status_window: status_window.retain(),
+                status_view: status_view.retain(),
                 touch_context_menu_opened: std::cell::Cell::new(false),
             });
         let view: objc2::rc::Retained<TrayInputOverlayView> = objc2::msg_send![
@@ -974,19 +1069,19 @@ fn install_tray_input_overlay(
     overlay_window.setContentView(Some(overlay_ns_view));
     overlay_window.orderFrontRegardless();
     log::debug!(
-        "tray context menu: installed input overlay frame=({:.1},{:.1},{:.1},{:.1}) status_frame=({:.1},{:.1},{:.1},{:.1}) level={}",
+        "tray context menu: installed input overlay frame=({:.1},{:.1},{:.1},{:.1}) status_view_bounds=({:.1},{:.1},{:.1},{:.1}) level={}",
         frame.origin.x,
         frame.origin.y,
         frame.size.width,
         frame.size.height,
-        status_window.frame().origin.x,
-        status_window.frame().origin.y,
-        status_window.frame().size.width,
-        status_window.frame().size.height,
+        status_view.bounds().origin.x,
+        status_view.bounds().origin.y,
+        status_view.bounds().size.width,
+        status_view.bounds().size.height,
         NSPopUpMenuWindowLevel - 1
     );
 
-    install_tray_input_overlay_sync_timer(&overlay_window, &overlay_view, status_window);
+    install_tray_input_overlay_sync_timer(&overlay_window, &overlay_view, status_view);
 
     std::mem::forget(overlay_window);
     std::mem::forget(overlay_view);
@@ -997,6 +1092,14 @@ fn install_tray_overlay_click_gestures(
     view: &objc2_app_kit::NSView,
     target: &TrayInputOverlayView,
 ) {
+    let target: &objc2::runtime::AnyObject =
+        unsafe { &*(target as *const TrayInputOverlayView).cast::<objc2::runtime::AnyObject>() };
+
+    install_tray_click_gestures(view, target);
+}
+
+#[cfg(target_os = "macos")]
+fn install_tray_click_gestures(view: &objc2_app_kit::NSView, target: &objc2::runtime::AnyObject) {
     use objc2::ClassType;
     use objc2_app_kit::{NSClickGestureRecognizer, NSGestureRecognizer};
 
@@ -1004,8 +1107,6 @@ fn install_tray_overlay_click_gestures(
         log::warn!("tray context menu: cannot install click gestures off main thread");
         return;
     };
-    let target: &objc2::runtime::AnyObject =
-        unsafe { &*(target as *const TrayInputOverlayView).cast::<objc2::runtime::AnyObject>() };
 
     let secondary_click = NSClickGestureRecognizer::new(mtm);
     configure_tray_overlay_click_gesture(&secondary_click, target, 1 << 1, 1, false, true);
@@ -1017,7 +1118,7 @@ fn install_tray_overlay_click_gestures(
     let two_touch_click: &NSGestureRecognizer = two_touch_click.as_super();
     view.addGestureRecognizer(two_touch_click);
 
-    log::debug!("tray context menu: installed overlay click gestures");
+    log::debug!("tray context menu: installed click gestures");
 }
 
 #[cfg(target_os = "macos")]
@@ -1050,7 +1151,7 @@ fn configure_tray_overlay_click_gesture(
 fn install_tray_input_overlay_sync_timer(
     overlay_window: &objc2_app_kit::NSWindow,
     overlay_view: &TrayInputOverlayView,
-    status_window: &objc2_app_kit::NSWindow,
+    status_view: &objc2_app_kit::NSView,
 ) {
     use objc2::ClassType;
     use objc2_foundation::{NSPoint, NSRect, NSTimer};
@@ -1059,15 +1160,15 @@ fn install_tray_input_overlay_sync_timer(
     let state = std::rc::Rc::new(TrayInputOverlaySyncState {
         overlay_window: overlay_window.retain(),
         overlay_view: overlay_view.retain(),
-        status_window: status_window.retain(),
+        status_view: status_view.retain(),
     });
     let block_state = state.clone();
     let block = block2::RcBlock::new(move |_timer: NonNull<NSTimer>| {
-        let frame =
-            tray_input_overlay_frame_from_status_window_frame(block_state.status_window.frame());
-        block_state.overlay_window.setFrame_display(frame, false);
-        let overlay_ns_view: &objc2_app_kit::NSView = block_state.overlay_view.as_super();
-        overlay_ns_view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
+        if let Some(frame) = tray_input_overlay_frame_from_status_view(&block_state.status_view) {
+            block_state.overlay_window.setFrame_display(frame, false);
+            let overlay_ns_view: &objc2_app_kit::NSView = block_state.overlay_view.as_super();
+            overlay_ns_view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
+        }
     });
     let block_ref: &block2::DynBlock<dyn Fn(NonNull<NSTimer>)> = &block;
     let timer =
@@ -1079,7 +1180,14 @@ fn install_tray_input_overlay_sync_timer(
 }
 
 #[cfg(target_os = "macos")]
-fn tray_input_overlay_frame_from_status_window_frame(
+fn tray_input_overlay_frame_from_status_view(
+    view: &objc2_app_kit::NSView,
+) -> Option<objc2_foundation::NSRect> {
+    status_view_screen_frame(view).map(tray_input_overlay_frame_from_status_frame)
+}
+
+#[cfg(target_os = "macos")]
+fn tray_input_overlay_frame_from_status_frame(
     frame: objc2_foundation::NSRect,
 ) -> objc2_foundation::NSRect {
     objc2_foundation::NSRect::new(
@@ -1099,7 +1207,7 @@ fn tray_input_overlay_frame_from_status_window_frame(
 struct TraySecondaryClickPollState {
     menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
     status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
-    window: objc2::rc::Retained<objc2_app_kit::NSWindow>,
+    status_view: objc2::rc::Retained<objc2_app_kit::NSView>,
     secondary_button_was_down: std::cell::Cell<bool>,
 }
 
@@ -1107,7 +1215,7 @@ struct TraySecondaryClickPollState {
 fn install_secondary_click_poll_timer(
     menu: &objc2_app_kit::NSMenu,
     status_item: &objc2_app_kit::NSStatusItem,
-    window: &objc2_app_kit::NSWindow,
+    status_view: &objc2_app_kit::NSView,
 ) {
     use objc2_foundation::NSTimer;
     use std::ptr::NonNull;
@@ -1115,7 +1223,7 @@ fn install_secondary_click_poll_timer(
     let state = std::rc::Rc::new(TraySecondaryClickPollState {
         menu: menu.retain(),
         status_item: status_item.retain(),
-        window: window.retain(),
+        status_view: status_view.retain(),
         secondary_button_was_down: std::cell::Cell::new(false),
     });
     let block_state = state.clone();
@@ -1128,7 +1236,7 @@ fn install_secondary_click_poll_timer(
         if should_open_tray_menu_from_polled_button_state(
             secondary_button_was_down,
             secondary_button_is_down,
-            is_mouse_inside_window(&block_state.window),
+            is_mouse_inside_status_view(&block_state.status_view),
         ) {
             log::debug!("tray context menu: polled secondary button down");
             show_native_tray_menu(&block_state.status_item, &block_state.menu);
@@ -1148,26 +1256,26 @@ fn install_secondary_click_poll_timer(
 fn install_status_item_event_tap(
     menu: &objc2_app_kit::NSMenu,
     status_item: &objc2_app_kit::NSStatusItem,
-    window: &objc2_app_kit::NSWindow,
+    status_view: &objc2_app_kit::NSView,
 ) {
     use objc2_core_graphics::CGEventTapLocation;
 
     install_status_item_event_tap_at_location(
         menu,
         status_item,
-        window,
+        status_view,
         CGEventTapLocation::HIDEventTap,
     );
     install_status_item_event_tap_at_location(
         menu,
         status_item,
-        window,
+        status_view,
         CGEventTapLocation::SessionEventTap,
     );
     install_status_item_event_tap_at_location(
         menu,
         status_item,
-        window,
+        status_view,
         CGEventTapLocation::AnnotatedSessionEventTap,
     );
 }
@@ -1176,7 +1284,7 @@ fn install_status_item_event_tap(
 fn install_status_item_event_tap_at_location(
     menu: &objc2_app_kit::NSMenu,
     status_item: &objc2_app_kit::NSStatusItem,
-    window: &objc2_app_kit::NSWindow,
+    status_view: &objc2_app_kit::NSView,
     location: objc2_core_graphics::CGEventTapLocation,
 ) {
     use objc2_core_foundation::{CFMachPort, CFRunLoop, kCFRunLoopCommonModes};
@@ -1185,7 +1293,7 @@ fn install_status_item_event_tap_at_location(
     let state = Box::new(TrayEventTapState {
         menu: menu.retain(),
         status_item: status_item.retain(),
-        window: window.retain(),
+        status_view: status_view.retain(),
     });
     let state_ptr = Box::into_raw(state);
     let event_mask = cg_event_mask(CGEventType::RightMouseDown)
@@ -1262,7 +1370,7 @@ unsafe extern "C-unwind" fn status_item_event_tap_callback(
     let state = unsafe { &*(user_info.cast::<TrayEventTapState>()) };
     let cg_event = unsafe { event.as_ref() };
     if should_open_tray_menu_from_cg_event(event_type, cg_event)
-        && is_mouse_inside_window(&state.window)
+        && is_mouse_inside_status_view(&state.status_view)
     {
         log::debug!(
             "tray context menu: CoreGraphics event tap open event_type={:?}",
@@ -1411,11 +1519,14 @@ fn should_skip_recent_native_menu_open(now: std::time::Instant) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn is_mouse_inside_window(window: &objc2_app_kit::NSWindow) -> bool {
+fn is_mouse_inside_status_view(view: &objc2_app_kit::NSView) -> bool {
+    let Some(frame) = status_view_screen_frame(view) else {
+        return false;
+    };
     let point = objc2_app_kit::NSEvent::mouseLocation();
     is_point_inside_rect_with_padding(
         point,
-        window.frame(),
+        frame,
         STATUS_ITEM_HORIZONTAL_HIT_PADDING,
         STATUS_ITEM_VERTICAL_HIT_PADDING,
     )
@@ -1652,7 +1763,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn detects_points_inside_status_window_frame() {
+    fn detects_points_inside_status_frame() {
         use objc2_foundation::{NSPoint, NSRect, NSSize};
 
         let rect = NSRect::new(NSPoint::new(100.0, 900.0), NSSize::new(24.0, 22.0));
@@ -1679,11 +1790,11 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn tray_input_overlay_frame_expands_status_window_hit_area() {
+    fn tray_input_overlay_frame_expands_status_hit_area() {
         use objc2_foundation::{NSPoint, NSRect, NSSize};
 
         let frame = NSRect::new(NSPoint::new(100.0, 900.0), NSSize::new(24.0, 22.0));
-        let overlay = tray_input_overlay_frame_from_status_window_frame(frame);
+        let overlay = tray_input_overlay_frame_from_status_frame(frame);
 
         assert_eq!(
             overlay.origin.x,
