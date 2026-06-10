@@ -12,6 +12,10 @@ use crate::panel::{get_or_init_panel, position_panel_at_tray_icon, show_panel};
 
 const LOG_LEVEL_STORE_KEY: &str = "logLevel";
 
+fn should_open_tray_menu(button: MouseButton, button_state: MouseButtonState) -> bool {
+    button == MouseButton::Right && button_state == MouseButtonState::Up
+}
+
 fn get_stored_log_level(app_handle: &AppHandle) -> log::LevelFilter {
     let store = match app_handle.store("settings.json") {
         Ok(s) => s,
@@ -251,10 +255,10 @@ pub fn create(app_handle: &AppHandle) -> tauri::Result<()> {
                     position_panel_at_tray_icon(app_handle, rect.position, rect.size);
                 }
                 // Right click opens the menu. Pop it up manually (at the cursor)
-                // since it isn't attached to the tray icon. Down only, so the
-                // following Up event doesn't reopen it.
+                // since it isn't attached to the tray icon. Up only avoids the
+                // press/release cycle immediately dismissing the menu on newer macOS.
                 MouseButton::Right => {
-                    if button_state != MouseButtonState::Down {
+                    if !should_open_tray_menu(button, button_state) {
                         return;
                     }
                     log::debug!("tray right click: showing menu");
@@ -272,4 +276,25 @@ pub fn create(app_handle: &AppHandle) -> tauri::Result<()> {
         .build(app_handle)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opens_tray_menu_on_right_mouse_up_only() {
+        assert!(should_open_tray_menu(
+            MouseButton::Right,
+            MouseButtonState::Up
+        ));
+        assert!(!should_open_tray_menu(
+            MouseButton::Right,
+            MouseButtonState::Down
+        ));
+        assert!(!should_open_tray_menu(
+            MouseButton::Left,
+            MouseButtonState::Up
+        ));
+    }
 }
