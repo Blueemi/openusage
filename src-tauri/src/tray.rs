@@ -294,11 +294,10 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
     let app_handle = app_handle.clone();
     if let Err(error) = tray.with_inner_tray_icon(move |inner| {
         use muda::ContextMenu as _;
-        use objc2::ClassType;
-        use objc2_app_kit::{NSEvent, NSEventMask, NSMenu, NSView};
+        use objc2::{ClassType, Message};
+        use objc2_app_kit::{NSEvent, NSEventMask, NSMenu, NSView, NSWindow};
         use objc2_foundation::MainThreadMarker;
         use std::cell::Cell;
-        use std::ffi::c_void;
         use std::ptr;
         use std::ptr::NonNull;
 
@@ -325,6 +324,8 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
             }
         };
         let ns_menu = unsafe { &*(menu.ns_menu().cast::<NSMenu>()) };
+        let local_ns_menu = ns_menu.retain();
+        let global_ns_menu = ns_menu.retain();
         let button_view: &NSView = button.as_super().as_super().as_super();
         set_context_menu_on_view_tree(button_view, ns_menu);
 
@@ -335,7 +336,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         };
 
         let status_window_number = window.windowNumber();
-        let button_view_ptr = button_view as *const NSView as *const c_void;
+        let status_window: objc2::rc::Retained<NSWindow> = window.clone();
         let last_event_number = Cell::new(-1);
         let block = block2::RcBlock::new(move |event_ptr: NonNull<NSEvent>| -> *mut NSEvent {
             let event = unsafe { event_ptr.as_ref() };
@@ -351,9 +352,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
             }
             last_event_number.set(event_number);
 
-            unsafe {
-                menu.show_context_menu_for_nsview(button_view_ptr, None);
-            }
+            show_native_tray_menu(&local_ns_menu);
 
             ptr::null_mut()
         });
@@ -373,8 +372,37 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         } else {
             log::warn!("tray context menu: AppKit did not install event monitor");
         }
-        // NSMenu keeps a weak delegate; leaking the block keeps its muda menu alive.
+
+        let last_global_event_number = Cell::new(-1);
+        let global_block = block2::RcBlock::new(move |event_ptr: NonNull<NSEvent>| {
+            let event = unsafe { event_ptr.as_ref() };
+            if !should_open_tray_menu_from_native_event(event)
+                || !is_mouse_inside_window(&status_window)
+            {
+                return;
+            }
+
+            let event_number = event.eventNumber();
+            if event_number != 0 && event_number == last_global_event_number.get() {
+                return;
+            }
+            last_global_event_number.set(event_number);
+
+            show_native_tray_menu(&global_ns_menu);
+        });
+        let global_block_ref: &block2::DynBlock<dyn Fn(NonNull<NSEvent>)> = &global_block;
+        let global_token =
+            NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, global_block_ref);
+        if let Some(global_token) = global_token {
+            std::mem::forget(global_token);
+        } else {
+            log::warn!("tray context menu: AppKit did not install global event monitor");
+        }
+
+        // NSMenu keeps a weak delegate; keep all native monitor state alive.
+        std::mem::forget(menu);
         std::mem::forget(block);
+        std::mem::forget(global_block);
     }) {
         log::warn!("tray context menu: failed to install native menu: {error}");
     }
@@ -396,6 +424,30 @@ fn set_context_menu_on_view_tree(
     for subview in view.subviews() {
         set_context_menu_on_view_tree(&subview, menu);
     }
+}
+
+#[cfg(target_os = "macos")]
+fn show_native_tray_menu(menu: &objc2_app_kit::NSMenu) {
+    let location = objc2_app_kit::NSEvent::mouseLocation();
+    menu.popUpMenuPositioningItem_atLocation_inView(None, location, None);
+}
+
+#[cfg(target_os = "macos")]
+fn is_mouse_inside_window(window: &objc2_app_kit::NSWindow) -> bool {
+    let point = objc2_app_kit::NSEvent::mouseLocation();
+    is_point_inside_rect_with_padding(point, window.frame(), 3.0)
+}
+
+#[cfg(target_os = "macos")]
+fn is_point_inside_rect_with_padding(
+    point: objc2_foundation::NSPoint,
+    rect: objc2_foundation::NSRect,
+    padding: f64,
+) -> bool {
+    point.x >= rect.origin.x - padding
+        && point.x <= rect.origin.x + rect.size.width + padding
+        && point.y >= rect.origin.y - padding
+        && point.y <= rect.origin.y + rect.size.height + padding
 }
 
 #[cfg(target_os = "macos")]
@@ -558,6 +610,30 @@ mod tests {
         assert!(!should_open_tray_menu_from_native_event_type(
             NSEventType::RightMouseUp,
             NSEventModifierFlags::empty()
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn detects_points_inside_status_window_frame() {
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+        let rect = NSRect::new(NSPoint::new(100.0, 900.0), NSSize::new(24.0, 22.0));
+
+        assert!(is_point_inside_rect_with_padding(
+            NSPoint::new(112.0, 911.0),
+            rect,
+            3.0
+        ));
+        assert!(is_point_inside_rect_with_padding(
+            NSPoint::new(98.0, 899.0),
+            rect,
+            3.0
+        ));
+        assert!(!is_point_inside_rect_with_padding(
+            NSPoint::new(80.0, 911.0),
+            rect,
+            3.0
         ));
     }
 }
