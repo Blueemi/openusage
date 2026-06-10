@@ -354,6 +354,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         let global_status_view = button_view.retain();
         install_status_item_event_tap(ns_menu, &status_item, button_view);
         install_secondary_click_poll_timer(ns_menu, &status_item, button_view);
+        crate::macos_trackpad::install_context_click_fallback(ns_menu, &status_item, button_view);
         log::debug!("tray context menu: installed on status button view tree");
 
         let last_event_number = Cell::new(-1);
@@ -1039,9 +1040,14 @@ fn active_touch_count_for_event(
     event: &objc2_app_kit::NSEvent,
     view: &objc2_app_kit::NSView,
 ) -> usize {
-    event
+    let touches_in_view = event
         .touchesMatchingPhase_inView(objc2_app_kit::NSTouchPhase::Touching, Some(view))
-        .count()
+        .count();
+    let touches_in_event = event
+        .touchesMatchingPhase_inView(objc2_app_kit::NSTouchPhase::Touching, None)
+        .count();
+
+    touches_in_view.max(touches_in_event)
 }
 
 #[cfg(target_os = "macos")]
@@ -1412,7 +1418,10 @@ fn set_context_menu_on_view_tree(view: &objc2_app_kit::NSView, menu: &objc2_app_
 
 #[cfg(target_os = "macos")]
 #[allow(deprecated)]
-fn show_native_tray_menu(status_item: &objc2_app_kit::NSStatusItem, menu: &objc2_app_kit::NSMenu) {
+pub(crate) fn show_native_tray_menu(
+    status_item: &objc2_app_kit::NSStatusItem,
+    menu: &objc2_app_kit::NSMenu,
+) {
     if should_skip_recent_native_menu_open(std::time::Instant::now()) {
         return;
     }
@@ -1479,7 +1488,7 @@ fn should_skip_recent_native_menu_open(now: std::time::Instant) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn is_mouse_inside_status_view(view: &objc2_app_kit::NSView) -> bool {
+pub(crate) fn is_mouse_inside_status_view(view: &objc2_app_kit::NSView) -> bool {
     let Some(frame) = status_view_screen_frame(view) else {
         return false;
     };

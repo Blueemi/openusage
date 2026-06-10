@@ -3,6 +3,8 @@ mod app_nap;
 mod config;
 mod local_http_api;
 mod log_path;
+#[cfg(target_os = "macos")]
+mod macos_trackpad;
 mod panel;
 mod plugin_engine;
 mod tray;
