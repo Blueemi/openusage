@@ -747,6 +747,7 @@ struct TrayInputOverlayViewIvars {
     menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
     status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
     status_view: objc2::rc::Retained<objc2_app_kit::NSView>,
+    two_touch_menu_open: std::cell::Cell<bool>,
 }
 
 #[cfg(target_os = "macos")]
@@ -786,6 +787,26 @@ objc2::define_class!(
             }
         }
 
+        #[unsafe(method(touchesBeganWithEvent:))]
+        fn touches_began_with_event(&self, event: &objc2_app_kit::NSEvent) {
+            self.handle_touch_event(event);
+        }
+
+        #[unsafe(method(touchesMovedWithEvent:))]
+        fn touches_moved_with_event(&self, event: &objc2_app_kit::NSEvent) {
+            self.handle_touch_event(event);
+        }
+
+        #[unsafe(method(touchesEndedWithEvent:))]
+        fn touches_ended_with_event(&self, event: &objc2_app_kit::NSEvent) {
+            self.handle_touch_event(event);
+        }
+
+        #[unsafe(method(touchesCancelledWithEvent:))]
+        fn touches_cancelled_with_event(&self, event: &objc2_app_kit::NSEvent) {
+            self.handle_touch_event(event);
+        }
+
         #[unsafe(method(menuForEvent:))]
         fn menu_for_event(
             &self,
@@ -806,6 +827,12 @@ objc2::define_class!(
 
 #[cfg(target_os = "macos")]
 impl TrayInputOverlayView {
+    fn as_view(&self) -> &objc2_app_kit::NSView {
+        use objc2::ClassType;
+
+        self.as_super()
+    }
+
     fn update_tray_rect(&self) {
         update_native_tray_rect_from_view(&self.ivars().status_view);
     }
@@ -813,6 +840,23 @@ impl TrayInputOverlayView {
     fn open_context_menu(&self) {
         self.update_tray_rect();
         show_native_tray_menu(&self.ivars().status_item, &self.ivars().menu);
+    }
+
+    fn handle_touch_event(&self, event: &objc2_app_kit::NSEvent) {
+        let touch_count = active_touch_count_for_event(event, self.as_view());
+        if should_open_tray_menu_from_touch_count(
+            self.ivars().two_touch_menu_open.get(),
+            touch_count,
+        ) {
+            self.ivars().two_touch_menu_open.set(true);
+            log::debug!("tray context menu: opening from two-touch overlay event");
+            self.open_context_menu();
+            return;
+        }
+
+        if should_reset_touch_menu_gate(touch_count) {
+            self.ivars().two_touch_menu_open.set(false);
+        }
     }
 }
 
@@ -875,6 +919,7 @@ fn install_tray_input_overlay(
             menu: menu.retain(),
             status_item: status_item.retain(),
             status_view: status_view.retain(),
+            two_touch_menu_open: std::cell::Cell::new(false),
         });
         let view: objc2::rc::Retained<TrayInputOverlayView> = msg_send![
             super(view),
@@ -883,6 +928,8 @@ fn install_tray_input_overlay(
         view
     };
     let overlay_ns_view: &objc2_app_kit::NSView = overlay_view.as_super();
+    overlay_ns_view.setWantsRestingTouches(true);
+    overlay_ns_view.setAllowedTouchTypes(objc2_app_kit::NSTouchTypeMask::Indirect);
     overlay_ns_view.setAutoresizingMask(
         objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
             | objc2_app_kit::NSAutoresizingMaskOptions::ViewHeightSizable,
@@ -958,6 +1005,29 @@ fn tray_input_overlay_frame_from_status_frame(
 #[cfg(target_os = "macos")]
 fn tray_input_overlay_window_level() -> objc2_app_kit::NSWindowLevel {
     objc2_app_kit::NSScreenSaverWindowLevel + 1
+}
+
+#[cfg(target_os = "macos")]
+fn active_touch_count_for_event(
+    event: &objc2_app_kit::NSEvent,
+    view: &objc2_app_kit::NSView,
+) -> usize {
+    event
+        .touchesMatchingPhase_inView(objc2_app_kit::NSTouchPhase::Touching, Some(view))
+        .count()
+}
+
+#[cfg(target_os = "macos")]
+fn should_open_tray_menu_from_touch_count(
+    menu_open_for_current_touch: bool,
+    touch_count: usize,
+) -> bool {
+    !menu_open_for_current_touch && touch_count >= 2
+}
+
+#[cfg(target_os = "macos")]
+fn should_reset_touch_menu_gate(touch_count: usize) -> bool {
+    touch_count < 2
 }
 
 #[cfg(target_os = "macos")]
@@ -1679,6 +1749,23 @@ mod tests {
     fn tray_input_overlay_sits_above_status_and_popup_levels() {
         assert!(tray_input_overlay_window_level() > objc2_app_kit::NSStatusWindowLevel);
         assert!(tray_input_overlay_window_level() > objc2_app_kit::NSPopUpMenuWindowLevel);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tray_input_overlay_touch_gate_opens_once_per_two_touch_sequence() {
+        assert!(should_open_tray_menu_from_touch_count(false, 2));
+        assert!(should_open_tray_menu_from_touch_count(false, 3));
+        assert!(!should_open_tray_menu_from_touch_count(false, 1));
+        assert!(!should_open_tray_menu_from_touch_count(true, 2));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tray_input_overlay_touch_gate_resets_below_two_touches() {
+        assert!(should_reset_touch_menu_gate(0));
+        assert!(should_reset_touch_menu_gate(1));
+        assert!(!should_reset_touch_menu_gate(2));
     }
 
     #[cfg(target_os = "macos")]
