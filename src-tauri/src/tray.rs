@@ -11,7 +11,7 @@ use crate::log_path;
 use crate::panel::{get_or_init_panel, position_panel_at_tray_icon, show_panel};
 
 #[cfg(target_os = "macos")]
-use objc2::Message as _;
+use objc2::{AnyThread as _, ClassType as _, DeclaredClass as _, Message as _, msg_send};
 
 const LOG_LEVEL_STORE_KEY: &str = "logLevel";
 
@@ -338,6 +338,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         let button_view: &NSView = button.as_super().as_super().as_super();
         set_context_menu_on_view_tree(button_view, ns_menu);
         update_native_tray_rect_from_view(button_view);
+        install_status_button_action_target(ns_menu, &status_item, &button);
 
         let Some(window) = button.window() else {
             log::warn!("tray context menu: status item window unavailable");
@@ -426,6 +427,129 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
     }) {
         log::warn!("tray context menu: failed to install native menu: {error}");
     }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct TrayStatusButtonActionTargetIvars {
+    menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
+    status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
+    last_event_number: std::cell::Cell<isize>,
+}
+
+#[cfg(target_os = "macos")]
+objc2::define_class!(
+    #[derive(Debug)]
+    #[unsafe(super(objc2_foundation::NSObject))]
+    #[name = "OpenUsageTrayStatusButtonActionTarget"]
+    #[ivars = TrayStatusButtonActionTargetIvars]
+    struct TrayStatusButtonActionTarget;
+
+    impl TrayStatusButtonActionTarget {
+        #[unsafe(method(handleOpenUsageTrayStatusButtonAction:))]
+        fn handle_status_button_action(&self, _sender: &objc2_app_kit::NSStatusBarButton) {
+            let Some(mtm) = objc2_foundation::MainThreadMarker::new() else {
+                log::warn!("tray context menu: status button action off main thread");
+                return;
+            };
+            let application = objc2_app_kit::NSApplication::sharedApplication(mtm);
+            let Some(event) = application.currentEvent() else {
+                log::debug!("tray context menu: status button action without current event");
+                return;
+            };
+
+            log::debug!(
+                "tray context menu: status button action event_type={:?} event_number={}",
+                event.r#type(),
+                event.eventNumber()
+            );
+            if !should_open_tray_menu_from_status_button_action_event(&event) {
+                return;
+            }
+
+            let ivars = self.ivars();
+            let event_number = event.eventNumber();
+            if event_number != 0 && event_number == ivars.last_event_number.get() {
+                return;
+            }
+            ivars.last_event_number.set(event_number);
+
+            show_native_tray_menu(&ivars.status_item, &ivars.menu);
+        }
+    }
+);
+
+#[cfg(target_os = "macos")]
+impl TrayStatusButtonActionTarget {
+    fn new(
+        menu: &objc2_app_kit::NSMenu,
+        status_item: &objc2_app_kit::NSStatusItem,
+    ) -> objc2::rc::Retained<Self> {
+        let this = Self::alloc().set_ivars(TrayStatusButtonActionTargetIvars {
+            menu: menu.retain(),
+            status_item: status_item.retain(),
+            last_event_number: std::cell::Cell::new(-1),
+        });
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_status_button_action_target(
+    menu: &objc2_app_kit::NSMenu,
+    status_item: &objc2_app_kit::NSStatusItem,
+    button: &objc2_app_kit::NSStatusBarButton,
+) {
+    let target = TrayStatusButtonActionTarget::new(menu, status_item);
+    let target_object: objc2::rc::Retained<objc2::runtime::AnyObject> = target.into();
+    let control: &objc2_app_kit::NSControl = button.as_super().as_super();
+
+    unsafe {
+        control.setTarget(Some(&target_object));
+        control.setAction(Some(objc2::sel!(handleOpenUsageTrayStatusButtonAction:)));
+    }
+    control.sendActionOn(status_button_action_event_mask());
+
+    // NSControl's target is weak, so keep the action bridge alive for the app lifetime.
+    std::mem::forget(target_object);
+    log::debug!("tray context menu: installed status button action target");
+}
+
+#[cfg(target_os = "macos")]
+fn status_button_action_event_mask() -> objc2_app_kit::NSEventMask {
+    use objc2_app_kit::NSEventMask;
+
+    NSEventMask::RightMouseDown
+        | NSEventMask::RightMouseUp
+        | NSEventMask::OtherMouseDown
+        | NSEventMask::OtherMouseUp
+        | NSEventMask::LeftMouseDown
+        | NSEventMask::LeftMouseUp
+}
+
+#[cfg(target_os = "macos")]
+fn should_open_tray_menu_from_status_button_action_event(event: &objc2_app_kit::NSEvent) -> bool {
+    should_open_tray_menu_from_status_button_action_event_details(
+        event.r#type(),
+        event.modifierFlags(),
+        event.buttonNumber(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn should_open_tray_menu_from_status_button_action_event_details(
+    event_type: objc2_app_kit::NSEventType,
+    modifier_flags: objc2_app_kit::NSEventModifierFlags,
+    button_number: isize,
+) -> bool {
+    use objc2_app_kit::{NSEventModifierFlags, NSEventType};
+
+    event_type == NSEventType::RightMouseDown
+        || event_type == NSEventType::RightMouseUp
+        || event_type == NSEventType::OtherMouseDown
+        || event_type == NSEventType::OtherMouseUp
+        || ((event_type == NSEventType::LeftMouseDown || event_type == NSEventType::LeftMouseUp)
+            && (modifier_flags.contains(NSEventModifierFlags::Control) || button_number == 1))
 }
 
 #[cfg(target_os = "macos")]
@@ -1048,6 +1172,49 @@ mod tests {
             NSEventType::Pressure,
             NSEventModifierFlags::empty()
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn status_button_action_mask_includes_secondary_mouse_events() {
+        use objc2_app_kit::NSEventMask;
+
+        let mask = status_button_action_event_mask();
+
+        assert!(mask.contains(NSEventMask::RightMouseDown));
+        assert!(mask.contains(NSEventMask::RightMouseUp));
+        assert!(mask.contains(NSEventMask::OtherMouseDown));
+        assert!(mask.contains(NSEventMask::OtherMouseUp));
+        assert!(mask.contains(NSEventMask::LeftMouseDown));
+        assert!(mask.contains(NSEventMask::LeftMouseUp));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn status_button_action_opens_for_secondary_left_mouse_shape() {
+        use objc2_app_kit::{NSEventModifierFlags, NSEventType};
+
+        assert!(
+            should_open_tray_menu_from_status_button_action_event_details(
+                NSEventType::LeftMouseDown,
+                NSEventModifierFlags::empty(),
+                1
+            )
+        );
+        assert!(
+            should_open_tray_menu_from_status_button_action_event_details(
+                NSEventType::LeftMouseDown,
+                NSEventModifierFlags::Control,
+                0
+            )
+        );
+        assert!(
+            !should_open_tray_menu_from_status_button_action_event_details(
+                NSEventType::LeftMouseDown,
+                NSEventModifierFlags::empty(),
+                0
+            )
+        );
     }
 
     #[cfg(target_os = "macos")]
