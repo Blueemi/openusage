@@ -334,13 +334,14 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
             }
         };
         let ns_menu = unsafe { &*(menu.ns_menu().cast::<NSMenu>()) };
+        status_item.setMenu(Some(ns_menu));
         let local_ns_menu = ns_menu.retain();
         let local_status_item = status_item.retain();
         let global_ns_menu = ns_menu.retain();
         let global_status_item = status_item.retain();
         let button_view: &NSView = button.as_super().as_super().as_super();
         remove_status_item_overlay_subviews(button_view);
-        install_native_status_button(&button, app_handle.clone(), ns_menu);
+        install_native_status_button(&button, &status_item, app_handle.clone(), ns_menu);
         set_context_menu_on_view_tree(button_view, ns_menu);
         update_native_tray_rect_from_view(button_view);
 
@@ -436,6 +437,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
 struct NativeStatusButtonState {
     app_handle: AppHandle,
     menu_ptr: usize,
+    status_item_ptr: usize,
     suppress_next_mouse_up: bool,
 }
 
@@ -471,6 +473,7 @@ objc2::define_class!(
                 return;
             }
 
+            self.set_status_item_menu_enabled(false);
             self.set_button_highlighted(true);
         }
 
@@ -480,11 +483,13 @@ objc2::define_class!(
             self.update_tray_rect();
             self.set_button_highlighted(false);
             if self.take_suppress_next_mouse_up() {
+                self.set_status_item_menu_enabled(true);
                 return;
             }
             if let Some(app_handle) = self.app_handle() {
                 toggle_panel(&app_handle);
             }
+            self.set_status_item_menu_enabled(true);
         }
 
         #[unsafe(method(rightMouseDown:))]
@@ -558,6 +563,11 @@ impl NativeTrayStatusButton {
         Some(unsafe { &*(menu_ptr as *const objc2_app_kit::NSMenu) })
     }
 
+    fn status_item(&self) -> Option<&'static objc2_app_kit::NSStatusItem> {
+        let status_item_ptr = self.status_item_ptr()?;
+        Some(unsafe { &*(status_item_ptr as *const objc2_app_kit::NSStatusItem) })
+    }
+
     fn set_button_highlighted(&self, highlighted: bool) {
         self.as_button().highlight(highlighted);
     }
@@ -576,6 +586,21 @@ impl NativeTrayStatusButton {
 
     fn menu_ptr(&self) -> Option<usize> {
         with_native_status_button_state(self.key(), |state| state.menu_ptr)
+    }
+
+    fn status_item_ptr(&self) -> Option<usize> {
+        with_native_status_button_state(self.key(), |state| state.status_item_ptr)
+    }
+
+    fn set_status_item_menu_enabled(&self, enabled: bool) {
+        let Some(status_item) = self.status_item() else {
+            return;
+        };
+        if enabled {
+            status_item.setMenu(self.context_menu());
+        } else {
+            status_item.setMenu(None);
+        }
     }
 
     fn set_suppress_next_mouse_up(&self, value: bool) {
@@ -597,6 +622,7 @@ impl NativeTrayStatusButton {
 #[cfg(target_os = "macos")]
 fn install_native_status_button(
     button: &objc2_app_kit::NSStatusBarButton,
+    status_item: &objc2_app_kit::NSStatusItem,
     app_handle: AppHandle,
     menu: &objc2_app_kit::NSMenu,
 ) {
@@ -604,12 +630,14 @@ fn install_native_status_button(
 
     let key = button as *const objc2_app_kit::NSStatusBarButton as usize;
     let menu_ptr = objc2::rc::Retained::into_raw(menu.retain()) as usize;
+    let status_item_ptr = objc2::rc::Retained::into_raw(status_item.retain()) as usize;
     if let Ok(mut states) = native_status_button_states().lock() {
         states.insert(
             key,
             NativeStatusButtonState {
                 app_handle,
                 menu_ptr,
+                status_item_ptr,
                 suppress_next_mouse_up: false,
             },
         );
@@ -764,6 +792,7 @@ objc2::define_class!(
 
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, _event: &objc2_app_kit::NSEvent) {
+            self.ivars().status_item.setMenu(None);
             self.update_tray_rect();
         }
 
@@ -773,6 +802,7 @@ objc2::define_class!(
             self.update_tray_rect();
             let app_handle = self.ivars().app_handle.clone();
             toggle_panel(&app_handle);
+            self.ivars().status_item.setMenu(Some(&self.ivars().menu));
         }
 
         #[unsafe(method(rightMouseDown:))]
@@ -1356,6 +1386,12 @@ fn should_open_tray_menu_from_native_event_type(
         || event_type == NSEventType::RightMouseUp
         || event_type == NSEventType::OtherMouseDown
         || event_type == NSEventType::OtherMouseUp
+        || event_type == NSEventType::SystemDefined
+        || event_type == NSEventType::Gesture
+        || event_type == NSEventType::BeginGesture
+        || event_type == NSEventType::EndGesture
+        || event_type == NSEventType::Pressure
+        || event_type == NSEventType::DirectTouch
         || (event_type == NSEventType::LeftMouseDown
             && modifier_flags.contains(NSEventModifierFlags::Control))
         || (event_type == NSEventType::LeftMouseUp
@@ -1528,8 +1564,20 @@ mod tests {
             NSEventType::LeftMouseDown,
             NSEventModifierFlags::empty()
         ));
-        assert!(!should_open_tray_menu_from_native_event_type(
+        assert!(should_open_tray_menu_from_native_event_type(
+            NSEventType::SystemDefined,
+            NSEventModifierFlags::empty()
+        ));
+        assert!(should_open_tray_menu_from_native_event_type(
             NSEventType::Gesture,
+            NSEventModifierFlags::empty()
+        ));
+        assert!(should_open_tray_menu_from_native_event_type(
+            NSEventType::DirectTouch,
+            NSEventModifierFlags::empty()
+        ));
+        assert!(should_open_tray_menu_from_native_event_type(
+            NSEventType::Pressure,
             NSEventModifierFlags::empty()
         ));
     }
