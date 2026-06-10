@@ -575,46 +575,59 @@ fn install_status_view_context_click_gestures_on_view(
     let target: &objc2::runtime::AnyObject =
         unsafe { &*(target as *const TrayStatusButtonActionTarget).cast() };
 
-    let secondary_click = NSClickGestureRecognizer::new(mtm);
-    configure_status_view_context_click_gesture(
-        &secondary_click,
-        target,
-        secondary_click_button_mask(),
-        1,
-        false,
-        true,
-    );
-    let secondary_click: &NSGestureRecognizer = secondary_click.as_super();
-    view.addGestureRecognizer(secondary_click);
+    for spec in status_view_context_click_gesture_specs() {
+        let click = NSClickGestureRecognizer::new(mtm);
+        configure_status_view_context_click_gesture(&click, target, spec);
+        let click: &NSGestureRecognizer = click.as_super();
+        view.addGestureRecognizer(click);
+    }
+}
 
-    let two_touch_click = NSClickGestureRecognizer::new(mtm);
-    configure_status_view_context_click_gesture(
-        &two_touch_click,
-        target,
-        primary_click_button_mask(),
-        2,
-        true,
-        false,
-    );
-    let two_touch_click: &NSGestureRecognizer = two_touch_click.as_super();
-    view.addGestureRecognizer(two_touch_click);
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StatusViewClickGestureSpec {
+    button_mask: objc2_foundation::NSUInteger,
+    touch_count: objc2_foundation::NSInteger,
+    delay_primary: bool,
+    delay_secondary: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn status_view_context_click_gesture_specs() -> [StatusViewClickGestureSpec; 3] {
+    [
+        StatusViewClickGestureSpec {
+            button_mask: secondary_click_button_mask(),
+            touch_count: 1,
+            delay_primary: false,
+            delay_secondary: true,
+        },
+        StatusViewClickGestureSpec {
+            button_mask: primary_click_button_mask(),
+            touch_count: 2,
+            delay_primary: true,
+            delay_secondary: false,
+        },
+        StatusViewClickGestureSpec {
+            button_mask: secondary_click_button_mask(),
+            touch_count: 2,
+            delay_primary: false,
+            delay_secondary: true,
+        },
+    ]
 }
 
 #[cfg(target_os = "macos")]
 fn configure_status_view_context_click_gesture(
     recognizer: &objc2_app_kit::NSClickGestureRecognizer,
     target: &objc2::runtime::AnyObject,
-    button_mask: objc2_foundation::NSUInteger,
-    touch_count: objc2_foundation::NSInteger,
-    delay_primary: bool,
-    delay_secondary: bool,
+    spec: StatusViewClickGestureSpec,
 ) {
     use objc2::ClassType;
     use objc2_app_kit::NSGestureRecognizer;
 
-    recognizer.setButtonMask(button_mask);
+    recognizer.setButtonMask(spec.button_mask);
     recognizer.setNumberOfClicksRequired(1);
-    recognizer.setNumberOfTouchesRequired(touch_count);
+    recognizer.setNumberOfTouchesRequired(spec.touch_count);
 
     let gesture: &NSGestureRecognizer = recognizer.as_super();
     unsafe {
@@ -623,8 +636,8 @@ fn configure_status_view_context_click_gesture(
             openOpenUsageTrayContextMenuFromClickGesture:
         )));
     }
-    gesture.setDelaysPrimaryMouseButtonEvents(delay_primary);
-    gesture.setDelaysSecondaryMouseButtonEvents(delay_secondary);
+    gesture.setDelaysPrimaryMouseButtonEvents(spec.delay_primary);
+    gesture.setDelaysSecondaryMouseButtonEvents(spec.delay_secondary);
     gesture.setDelaysOtherMouseButtonEvents(false);
 }
 
@@ -1765,6 +1778,31 @@ mod tests {
     fn status_view_click_gesture_masks_match_mouse_buttons() {
         assert_eq!(primary_click_button_mask(), 1 << 0);
         assert_eq!(secondary_click_button_mask(), 1 << 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn status_view_click_gestures_include_two_touch_secondary_click() {
+        let specs = status_view_context_click_gesture_specs();
+
+        assert!(specs.contains(&StatusViewClickGestureSpec {
+            button_mask: secondary_click_button_mask(),
+            touch_count: 1,
+            delay_primary: false,
+            delay_secondary: true,
+        }));
+        assert!(specs.contains(&StatusViewClickGestureSpec {
+            button_mask: primary_click_button_mask(),
+            touch_count: 2,
+            delay_primary: true,
+            delay_secondary: false,
+        }));
+        assert!(specs.contains(&StatusViewClickGestureSpec {
+            button_mask: secondary_click_button_mask(),
+            touch_count: 2,
+            delay_primary: false,
+            delay_secondary: true,
+        }));
     }
 
     #[cfg(target_os = "macos")]
