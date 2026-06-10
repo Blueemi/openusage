@@ -1036,6 +1036,14 @@ struct TrayEventTapState {
     menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
     status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
     status_view: objc2::rc::Retained<objc2_app_kit::NSView>,
+    mode: TrayEventTapMode,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrayEventTapMode {
+    Active,
+    ListenOnly,
 }
 
 #[cfg(target_os = "macos")]
@@ -1101,18 +1109,21 @@ fn install_status_item_event_tap(
         status_item,
         status_view,
         CGEventTapLocation::HIDEventTap,
+        TrayEventTapMode::Active,
     );
     install_status_item_event_tap_at_location(
         menu,
         status_item,
         status_view,
         CGEventTapLocation::SessionEventTap,
+        TrayEventTapMode::ListenOnly,
     );
     install_status_item_event_tap_at_location(
         menu,
         status_item,
         status_view,
         CGEventTapLocation::AnnotatedSessionEventTap,
+        TrayEventTapMode::ListenOnly,
     );
 }
 
@@ -1122,14 +1133,16 @@ fn install_status_item_event_tap_at_location(
     status_item: &objc2_app_kit::NSStatusItem,
     status_view: &objc2_app_kit::NSView,
     location: objc2_core_graphics::CGEventTapLocation,
+    mode: TrayEventTapMode,
 ) {
     use objc2_core_foundation::{CFMachPort, CFRunLoop, kCFRunLoopCommonModes};
-    use objc2_core_graphics::{CGEvent, CGEventTapOptions, CGEventTapPlacement, CGEventType};
+    use objc2_core_graphics::{CGEvent, CGEventTapPlacement, CGEventType};
 
     let state = Box::new(TrayEventTapState {
         menu: menu.retain(),
         status_item: status_item.retain(),
         status_view: status_view.retain(),
+        mode,
     });
     let state_ptr = Box::into_raw(state);
     let event_mask = cg_event_mask(CGEventType::RightMouseDown)
@@ -1143,7 +1156,7 @@ fn install_status_item_event_tap_at_location(
         CGEvent::tap_create(
             location,
             CGEventTapPlacement::HeadInsertEventTap,
-            CGEventTapOptions::ListenOnly,
+            event_tap_options_for_mode(mode),
             event_mask,
             Some(status_item_event_tap_callback),
             state_ptr.cast(),
@@ -1172,8 +1185,9 @@ fn install_status_item_event_tap_at_location(
         std::mem::forget(tap);
         std::mem::forget(source);
         log::debug!(
-            "tray context menu: installed CoreGraphics {:?} event tap",
-            location
+            "tray context menu: installed CoreGraphics {:?} {:?} event tap",
+            location,
+            mode
         );
     } else {
         let _ = unsafe { Box::from_raw(state_ptr) };
@@ -1213,9 +1227,41 @@ unsafe extern "C-unwind" fn status_item_event_tap_callback(
             event_type
         );
         show_native_tray_menu(&state.status_item, &state.menu);
+        if should_swallow_opened_cg_event(state.mode, event_type, cg_event) {
+            return std::ptr::null_mut();
+        }
     }
 
     event.as_ptr()
+}
+
+#[cfg(target_os = "macos")]
+fn event_tap_options_for_mode(mode: TrayEventTapMode) -> objc2_core_graphics::CGEventTapOptions {
+    match mode {
+        TrayEventTapMode::Active => objc2_core_graphics::CGEventTapOptions::Default,
+        TrayEventTapMode::ListenOnly => objc2_core_graphics::CGEventTapOptions::ListenOnly,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn should_swallow_opened_cg_event(
+    mode: TrayEventTapMode,
+    event_type: objc2_core_graphics::CGEventType,
+    event: &objc2_core_graphics::CGEvent,
+) -> bool {
+    mode == TrayEventTapMode::Active && should_open_tray_menu_from_cg_event(event_type, event)
+}
+
+#[cfg(target_os = "macos")]
+#[cfg(test)]
+fn should_swallow_opened_cg_event_details(
+    mode: TrayEventTapMode,
+    event_type: objc2_core_graphics::CGEventType,
+    flags: objc2_core_graphics::CGEventFlags,
+    button_number: i64,
+) -> bool {
+    mode == TrayEventTapMode::Active
+        && should_open_tray_menu_from_cg_event_details(event_type, flags, button_number)
 }
 
 #[cfg(target_os = "macos")]
@@ -1779,6 +1825,21 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn core_graphics_hid_tap_is_active_only_where_needed() {
+        use objc2_core_graphics::CGEventTapOptions;
+
+        assert_eq!(
+            event_tap_options_for_mode(TrayEventTapMode::Active),
+            CGEventTapOptions::Default
+        );
+        assert_eq!(
+            event_tap_options_for_mode(TrayEventTapMode::ListenOnly),
+            CGEventTapOptions::ListenOnly
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn core_graphics_mouse_down_or_up_can_open_tray_menu() {
         use objc2_core_graphics::{CGEventFlags, CGEventType};
 
@@ -1815,6 +1876,37 @@ mod tests {
         assert!(!should_open_tray_menu_from_cg_event_type(
             CGEventType::LeftMouseUp,
             CGEventFlags::empty()
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn active_core_graphics_tap_swallows_only_opened_context_events() {
+        use objc2_core_graphics::{CGEventFlags, CGEventType};
+
+        assert!(should_swallow_opened_cg_event_details(
+            TrayEventTapMode::Active,
+            CGEventType::RightMouseDown,
+            CGEventFlags::empty(),
+            1
+        ));
+        assert!(should_swallow_opened_cg_event_details(
+            TrayEventTapMode::Active,
+            CGEventType::LeftMouseDown,
+            CGEventFlags::MaskControl,
+            0
+        ));
+        assert!(!should_swallow_opened_cg_event_details(
+            TrayEventTapMode::ListenOnly,
+            CGEventType::RightMouseDown,
+            CGEventFlags::empty(),
+            1
+        ));
+        assert!(!should_swallow_opened_cg_event_details(
+            TrayEventTapMode::Active,
+            CGEventType::LeftMouseDown,
+            CGEventFlags::empty(),
+            0
         ));
     }
 
