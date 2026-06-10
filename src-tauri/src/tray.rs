@@ -343,6 +343,8 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
 
         let status_window_number = window.windowNumber();
         let status_window: objc2::rc::Retained<NSWindow> = window.clone();
+        install_status_item_event_tap(ns_menu, &status_window);
+
         let last_event_number = Cell::new(-1);
         let block = block2::RcBlock::new(move |event_ptr: NonNull<NSEvent>| -> *mut NSEvent {
             let event = unsafe { event_ptr.as_ref() };
@@ -419,7 +421,6 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
 #[derive(Debug)]
 struct TrayMenuGestureTargetIvars {
     menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
-    last_opened_at: std::cell::Cell<std::time::Instant>,
 }
 
 #[cfg(target_os = "macos")]
@@ -432,12 +433,6 @@ objc2::define_class!(
     impl TrayMenuGestureTarget {
         #[unsafe(method(openTrayMenu:))]
         fn open_tray_menu(&self, _sender: &objc2_app_kit::NSClickGestureRecognizer) {
-            let now = std::time::Instant::now();
-            let last_opened_at = self.ivars().last_opened_at.get();
-            if now.duration_since(last_opened_at) < std::time::Duration::from_millis(200) {
-                return;
-            }
-            self.ivars().last_opened_at.set(now);
             show_native_tray_menu(&self.ivars().menu);
         }
     }
@@ -449,14 +444,108 @@ impl TrayMenuGestureTarget {
         let mtm = objc2_foundation::MainThreadMarker::new().expect("main thread");
         let target = mtm.alloc().set_ivars(TrayMenuGestureTargetIvars {
             menu: menu.retain(),
-            last_opened_at: std::cell::Cell::new(
-                std::time::Instant::now()
-                    .checked_sub(std::time::Duration::from_secs(1))
-                    .unwrap_or_else(std::time::Instant::now),
-            ),
         });
         unsafe { objc2::msg_send![super(target), init] }
     }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct TrayEventTapState {
+    menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
+    window: objc2::rc::Retained<objc2_app_kit::NSWindow>,
+}
+
+#[cfg(target_os = "macos")]
+fn install_status_item_event_tap(menu: &objc2_app_kit::NSMenu, window: &objc2_app_kit::NSWindow) {
+    use objc2_core_foundation::{kCFRunLoopCommonModes, CFMachPort, CFRunLoop};
+    use objc2_core_graphics::{
+        CGEvent, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
+    };
+
+    let state = Box::new(TrayEventTapState {
+        menu: menu.retain(),
+        window: window.retain(),
+    });
+    let state_ptr = Box::into_raw(state);
+    let event_mask = cg_event_mask(CGEventType::RightMouseDown)
+        | cg_event_mask(CGEventType::OtherMouseDown)
+        | cg_event_mask(CGEventType::LeftMouseDown);
+
+    let Some(tap) = (unsafe {
+        CGEvent::tap_create(
+            CGEventTapLocation::SessionEventTap,
+            CGEventTapPlacement::HeadInsertEventTap,
+            CGEventTapOptions::ListenOnly,
+            event_mask,
+            Some(status_item_event_tap_callback),
+            state_ptr.cast(),
+        )
+    }) else {
+        let _ = unsafe { Box::from_raw(state_ptr) };
+        log::warn!("tray context menu: CoreGraphics event tap unavailable");
+        return;
+    };
+
+    let Some(source) = CFMachPort::new_run_loop_source(None, Some(&tap), 0) else {
+        let _ = unsafe { Box::from_raw(state_ptr) };
+        log::warn!("tray context menu: CoreGraphics event tap source unavailable");
+        return;
+    };
+
+    if let Some(run_loop) = CFRunLoop::main() {
+        run_loop.add_source(Some(&source), unsafe { kCFRunLoopCommonModes });
+        CGEvent::tap_enable(&tap, true);
+        std::mem::forget(tap);
+        std::mem::forget(source);
+        log::debug!("tray context menu: installed CoreGraphics event tap");
+    } else {
+        let _ = unsafe { Box::from_raw(state_ptr) };
+        log::warn!("tray context menu: CoreGraphics main run loop unavailable");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cg_event_mask(event_type: objc2_core_graphics::CGEventType) -> objc2_core_graphics::CGEventMask {
+    1u64 << event_type.0
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C-unwind" fn status_item_event_tap_callback(
+    _proxy: objc2_core_graphics::CGEventTapProxy,
+    event_type: objc2_core_graphics::CGEventType,
+    event: std::ptr::NonNull<objc2_core_graphics::CGEvent>,
+    user_info: *mut std::ffi::c_void,
+) -> *mut objc2_core_graphics::CGEvent {
+    if user_info.is_null()
+        || event_type == objc2_core_graphics::CGEventType::TapDisabledByTimeout
+        || event_type == objc2_core_graphics::CGEventType::TapDisabledByUserInput
+    {
+        return event.as_ptr();
+    }
+
+    let state = unsafe { &*(user_info.cast::<TrayEventTapState>()) };
+    let cg_event = unsafe { event.as_ref() };
+    if should_open_tray_menu_from_cg_event(event_type, cg_event)
+        && is_mouse_inside_window(&state.window)
+    {
+        show_native_tray_menu(&state.menu);
+    }
+
+    event.as_ptr()
+}
+
+#[cfg(target_os = "macos")]
+fn should_open_tray_menu_from_cg_event(
+    event_type: objc2_core_graphics::CGEventType,
+    event: &objc2_core_graphics::CGEvent,
+) -> bool {
+    use objc2_core_graphics::{CGEvent, CGEventFlags, CGEventType};
+
+    event_type == CGEventType::RightMouseDown
+        || event_type == CGEventType::OtherMouseDown
+        || (event_type == CGEventType::LeftMouseDown
+            && CGEvent::flags(Some(event)).contains(CGEventFlags::MaskControl))
 }
 
 #[cfg(target_os = "macos")]
@@ -511,8 +600,31 @@ fn set_context_menu_on_view_tree(view: &objc2_app_kit::NSView, menu: &objc2_app_
 
 #[cfg(target_os = "macos")]
 fn show_native_tray_menu(menu: &objc2_app_kit::NSMenu) {
+    if should_skip_recent_native_menu_open(std::time::Instant::now()) {
+        return;
+    }
+
     let location = objc2_app_kit::NSEvent::mouseLocation();
     menu.popUpMenuPositioningItem_atLocation_inView(None, location, None);
+}
+
+#[cfg(target_os = "macos")]
+fn should_skip_recent_native_menu_open(now: std::time::Instant) -> bool {
+    static LAST_OPENED_AT: std::sync::Mutex<Option<std::time::Instant>> =
+        std::sync::Mutex::new(None);
+
+    let Ok(mut last_opened_at) = LAST_OPENED_AT.lock() else {
+        return false;
+    };
+
+    if last_opened_at
+        .is_some_and(|last| now.duration_since(last) < std::time::Duration::from_millis(200))
+    {
+        return true;
+    }
+
+    *last_opened_at = Some(now);
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -724,5 +836,14 @@ mod tests {
     #[test]
     fn secondary_click_gesture_uses_right_button_mask() {
         assert_eq!(secondary_click_button_mask(), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn core_graphics_right_mouse_down_mask_matches_event_type() {
+        assert_eq!(
+            cg_event_mask(objc2_core_graphics::CGEventType::RightMouseDown),
+            1u64 << 3
+        );
     }
 }
