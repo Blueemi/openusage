@@ -256,6 +256,12 @@ pub fn create(app_handle: &AppHandle) -> tauri::Result<()> {
                     if button_state != MouseButtonState::Up {
                         return;
                     }
+                    #[cfg(target_os = "macos")]
+                    if native_menu_recently_opened_for_mouse_up(std::time::Instant::now()) {
+                        log::debug!("tray click: ignoring left mouse up after native menu open");
+                        return;
+                    }
+
                     let Some(panel) = get_or_init_panel!(app_handle) else {
                         return;
                     };
@@ -1094,6 +1100,7 @@ fn overlay_mouse_up_action(
         event.r#type(),
         event.modifierFlags(),
         event.buttonNumber(),
+        native_menu_recently_opened_for_mouse_up(std::time::Instant::now()),
     )
 }
 
@@ -1103,6 +1110,7 @@ fn overlay_mouse_up_action_details(
     event_type: objc2_app_kit::NSEventType,
     modifier_flags: objc2_app_kit::NSEventModifierFlags,
     button_number: isize,
+    native_menu_recently_opened: bool,
 ) -> TrayOverlayMouseUpAction {
     if suppress_next_mouse_up {
         return TrayOverlayMouseUpAction::Ignore;
@@ -1110,6 +1118,10 @@ fn overlay_mouse_up_action_details(
     if should_open_tray_menu_from_native_event_details(event_type, modifier_flags, button_number) {
         return TrayOverlayMouseUpAction::OpenMenu;
     }
+    if native_menu_recently_opened {
+        return TrayOverlayMouseUpAction::Ignore;
+    }
+
     TrayOverlayMouseUpAction::TogglePanel
 }
 
@@ -1483,21 +1495,43 @@ fn pop_up_native_tray_menu_at_view(
 
 #[cfg(target_os = "macos")]
 fn should_skip_recent_native_menu_open(now: std::time::Instant) -> bool {
-    static LAST_OPENED_AT: std::sync::Mutex<Option<std::time::Instant>> =
-        std::sync::Mutex::new(None);
-
-    let Ok(mut last_opened_at) = LAST_OPENED_AT.lock() else {
+    let Ok(mut last_opened_at) = native_menu_last_opened_at().lock() else {
         return false;
     };
 
-    if last_opened_at
-        .is_some_and(|last| now.duration_since(last) < std::time::Duration::from_millis(200))
-    {
+    if instant_is_within_window(*last_opened_at, now, std::time::Duration::from_millis(200)) {
         return true;
     }
 
     *last_opened_at = Some(now);
     false
+}
+
+#[cfg(target_os = "macos")]
+fn native_menu_recently_opened_for_mouse_up(now: std::time::Instant) -> bool {
+    let Ok(last_opened_at) = native_menu_last_opened_at().lock() else {
+        return false;
+    };
+
+    instant_is_within_window(*last_opened_at, now, std::time::Duration::from_millis(700))
+}
+
+#[cfg(target_os = "macos")]
+fn native_menu_last_opened_at() -> &'static std::sync::Mutex<Option<std::time::Instant>> {
+    static LAST_OPENED_AT: std::sync::Mutex<Option<std::time::Instant>> =
+        std::sync::Mutex::new(None);
+
+    &LAST_OPENED_AT
+}
+
+#[cfg(target_os = "macos")]
+fn instant_is_within_window(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+    window: std::time::Duration,
+) -> bool {
+    last.and_then(|last| now.checked_duration_since(last))
+        .is_some_and(|elapsed| elapsed < window)
 }
 
 #[cfg(target_os = "macos")]
@@ -1935,16 +1969,28 @@ mod tests {
                 false,
                 NSEventType::LeftMouseUp,
                 NSEventModifierFlags::empty(),
-                0
+                0,
+                false
             ),
             TrayOverlayMouseUpAction::TogglePanel
         );
         assert_eq!(
             overlay_mouse_up_action_details(
                 false,
+                NSEventType::LeftMouseUp,
+                NSEventModifierFlags::empty(),
+                0,
+                true
+            ),
+            TrayOverlayMouseUpAction::Ignore
+        );
+        assert_eq!(
+            overlay_mouse_up_action_details(
+                false,
                 NSEventType::RightMouseUp,
                 NSEventModifierFlags::empty(),
-                1
+                1,
+                false
             ),
             TrayOverlayMouseUpAction::OpenMenu
         );
@@ -1953,7 +1999,8 @@ mod tests {
                 false,
                 NSEventType::LeftMouseUp,
                 NSEventModifierFlags::empty(),
-                1
+                1,
+                false
             ),
             TrayOverlayMouseUpAction::OpenMenu
         );
@@ -1962,10 +2009,33 @@ mod tests {
                 true,
                 NSEventType::LeftMouseUp,
                 NSEventModifierFlags::empty(),
-                0
+                0,
+                false
             ),
             TrayOverlayMouseUpAction::Ignore
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recent_native_menu_open_window_expires() {
+        let now = std::time::Instant::now();
+
+        assert!(instant_is_within_window(
+            Some(now - std::time::Duration::from_millis(100)),
+            now,
+            std::time::Duration::from_millis(700)
+        ));
+        assert!(!instant_is_within_window(
+            Some(now - std::time::Duration::from_millis(700)),
+            now,
+            std::time::Duration::from_millis(700)
+        ));
+        assert!(!instant_is_within_window(
+            None,
+            now,
+            std::time::Duration::from_millis(700)
+        ));
     }
 
     #[cfg(target_os = "macos")]
