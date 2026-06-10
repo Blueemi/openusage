@@ -15,6 +15,11 @@ use objc2::Message as _;
 
 const LOG_LEVEL_STORE_KEY: &str = "logLevel";
 
+#[cfg(target_os = "macos")]
+const STATUS_ITEM_HORIZONTAL_HIT_PADDING: f64 = 3.0;
+#[cfg(target_os = "macos")]
+const STATUS_ITEM_VERTICAL_HIT_PADDING: f64 = 12.0;
+
 fn should_open_tray_menu(button: MouseButton, button_state: MouseButtonState) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -368,13 +373,11 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         });
         let block_ref: &block2::DynBlock<dyn Fn(NonNull<NSEvent>) -> *mut NSEvent> = &block;
         let mask = NSEventMask::RightMouseDown
+            | NSEventMask::RightMouseUp
             | NSEventMask::LeftMouseDown
+            | NSEventMask::LeftMouseUp
             | NSEventMask::OtherMouseDown
-            | NSEventMask::Gesture
-            | NSEventMask::BeginGesture
-            | NSEventMask::Pressure
-            | NSEventMask::DirectTouch
-            | NSEventMask::SystemDefined;
+            | NSEventMask::OtherMouseUp;
         let token =
             unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, block_ref) };
         if let Some(token) = token {
@@ -951,19 +954,25 @@ fn should_skip_recent_native_menu_open(now: std::time::Instant) -> bool {
 #[cfg(target_os = "macos")]
 fn is_mouse_inside_window(window: &objc2_app_kit::NSWindow) -> bool {
     let point = objc2_app_kit::NSEvent::mouseLocation();
-    is_point_inside_rect_with_padding(point, window.frame(), 3.0)
+    is_point_inside_rect_with_padding(
+        point,
+        window.frame(),
+        STATUS_ITEM_HORIZONTAL_HIT_PADDING,
+        STATUS_ITEM_VERTICAL_HIT_PADDING,
+    )
 }
 
 #[cfg(target_os = "macos")]
 fn is_point_inside_rect_with_padding(
     point: objc2_foundation::NSPoint,
     rect: objc2_foundation::NSRect,
-    padding: f64,
+    horizontal_padding: f64,
+    vertical_padding: f64,
 ) -> bool {
-    point.x >= rect.origin.x - padding
-        && point.x <= rect.origin.x + rect.size.width + padding
-        && point.y >= rect.origin.y - padding
-        && point.y <= rect.origin.y + rect.size.height + padding
+    point.x >= rect.origin.x - horizontal_padding
+        && point.x <= rect.origin.x + rect.size.width + horizontal_padding
+        && point.y >= rect.origin.y - vertical_padding
+        && point.y <= rect.origin.y + rect.size.height + vertical_padding
 }
 
 #[cfg(target_os = "macos")]
@@ -981,13 +990,7 @@ fn should_return_context_menu_from_native_event_type(
     event_type: objc2_app_kit::NSEventType,
     modifier_flags: objc2_app_kit::NSEventModifierFlags,
 ) -> bool {
-    use objc2_app_kit::{NSEventModifierFlags, NSEventType};
-
     should_open_tray_menu_from_native_event_type(event_type, modifier_flags)
-        || event_type == NSEventType::RightMouseUp
-        || event_type == NSEventType::OtherMouseUp
-        || (event_type == NSEventType::LeftMouseUp
-            && modifier_flags.contains(NSEventModifierFlags::Control))
 }
 
 #[cfg(target_os = "macos")]
@@ -998,14 +1001,13 @@ fn should_open_tray_menu_from_native_event_type(
     use objc2_app_kit::{NSEventModifierFlags, NSEventType};
 
     event_type == NSEventType::RightMouseDown
+        || event_type == NSEventType::RightMouseUp
         || event_type == NSEventType::OtherMouseDown
+        || event_type == NSEventType::OtherMouseUp
         || (event_type == NSEventType::LeftMouseDown
             && modifier_flags.contains(NSEventModifierFlags::Control))
-        || event_type == NSEventType::Gesture
-        || event_type == NSEventType::BeginGesture
-        || event_type == NSEventType::Pressure
-        || event_type == NSEventType::DirectTouch
-        || event_type == NSEventType::SystemDefined
+        || (event_type == NSEventType::LeftMouseUp
+            && modifier_flags.contains(NSEventModifierFlags::Control))
 }
 
 #[cfg(target_os = "macos")]
@@ -1135,15 +1137,23 @@ mod tests {
             NSEventModifierFlags::Control
         ));
         assert!(should_open_tray_menu_from_native_event_type(
-            NSEventType::Gesture,
+            NSEventType::RightMouseUp,
             NSEventModifierFlags::empty()
+        ));
+        assert!(should_open_tray_menu_from_native_event_type(
+            NSEventType::OtherMouseUp,
+            NSEventModifierFlags::empty()
+        ));
+        assert!(should_open_tray_menu_from_native_event_type(
+            NSEventType::LeftMouseUp,
+            NSEventModifierFlags::Control
         ));
         assert!(!should_open_tray_menu_from_native_event_type(
             NSEventType::LeftMouseDown,
             NSEventModifierFlags::empty()
         ));
         assert!(!should_open_tray_menu_from_native_event_type(
-            NSEventType::RightMouseUp,
+            NSEventType::Gesture,
             NSEventModifierFlags::empty()
         ));
     }
@@ -1181,17 +1191,20 @@ mod tests {
         assert!(is_point_inside_rect_with_padding(
             NSPoint::new(112.0, 911.0),
             rect,
-            3.0
+            STATUS_ITEM_HORIZONTAL_HIT_PADDING,
+            STATUS_ITEM_VERTICAL_HIT_PADDING
         ));
         assert!(is_point_inside_rect_with_padding(
-            NSPoint::new(98.0, 899.0),
+            NSPoint::new(112.0, 928.0),
             rect,
-            3.0
+            STATUS_ITEM_HORIZONTAL_HIT_PADDING,
+            STATUS_ITEM_VERTICAL_HIT_PADDING
         ));
         assert!(!is_point_inside_rect_with_padding(
             NSPoint::new(80.0, 911.0),
             rect,
-            3.0
+            STATUS_ITEM_HORIZONTAL_HIT_PADDING,
+            STATUS_ITEM_VERTICAL_HIT_PADDING
         ));
     }
 
