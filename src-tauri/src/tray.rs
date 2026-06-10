@@ -11,6 +11,8 @@ use crate::log_path;
 use crate::panel::{get_or_init_panel, position_panel_at_tray_icon, show_panel, toggle_panel};
 
 #[cfg(target_os = "macos")]
+use objc2::DeclaredClass as _;
+#[cfg(target_os = "macos")]
 use objc2::Message as _;
 
 const LOG_LEVEL_STORE_KEY: &str = "logLevel";
@@ -350,6 +352,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
 
         let status_window_number = window.windowNumber();
         let status_window: objc2::rc::Retained<NSWindow> = window.clone();
+        install_tray_input_overlay(&app_handle, ns_menu, &status_item, &status_window);
         install_status_item_event_tap(ns_menu, &status_item, &status_window);
         install_secondary_click_poll_timer(ns_menu, &status_item, &status_window);
 
@@ -378,7 +381,13 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
             | NSEventMask::LeftMouseDown
             | NSEventMask::LeftMouseUp
             | NSEventMask::OtherMouseDown
-            | NSEventMask::OtherMouseUp;
+            | NSEventMask::OtherMouseUp
+            | NSEventMask::SystemDefined
+            | NSEventMask::Gesture
+            | NSEventMask::BeginGesture
+            | NSEventMask::EndGesture
+            | NSEventMask::Pressure
+            | NSEventMask::DirectTouch;
         let token =
             unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, block_ref) };
         if let Some(token) = token {
@@ -739,6 +748,211 @@ struct TrayEventTapState {
 
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
+struct TrayInputOverlayViewIvars {
+    app_handle: AppHandle,
+    menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
+    status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
+    status_window: objc2::rc::Retained<objc2_app_kit::NSWindow>,
+}
+
+#[cfg(target_os = "macos")]
+objc2::define_class!(
+    #[unsafe(super(objc2_app_kit::NSView))]
+    #[name = "OpenUsageTrayInputOverlayView"]
+    #[ivars = TrayInputOverlayViewIvars]
+    #[derive(Debug)]
+    struct TrayInputOverlayView;
+
+    impl TrayInputOverlayView {
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&objc2_app_kit::NSEvent>) -> bool {
+            true
+        }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, _event: &objc2_app_kit::NSEvent) {
+            self.update_tray_rect();
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, _event: &objc2_app_kit::NSEvent) {
+            self.update_tray_rect();
+            let app_handle = self.ivars().app_handle.clone();
+            toggle_panel(&app_handle);
+        }
+
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, _event: &objc2_app_kit::NSEvent) {
+            self.open_context_menu();
+        }
+
+        #[unsafe(method(otherMouseDown:))]
+        fn other_mouse_down(&self, event: &objc2_app_kit::NSEvent) {
+            if should_open_tray_menu_from_mouse_button_number(event.buttonNumber()) {
+                self.open_context_menu();
+            }
+        }
+
+        #[unsafe(method(menuForEvent:))]
+        fn menu_for_event(
+            &self,
+            event: &objc2_app_kit::NSEvent,
+        ) -> Option<&'static objc2_app_kit::NSMenu> {
+            if should_return_context_menu_from_native_event(event)
+                && !should_skip_recent_native_menu_open(std::time::Instant::now())
+            {
+                self.update_tray_rect();
+                Some(unsafe {
+                    &*(objc2::rc::Retained::as_ptr(&self.ivars().menu)
+                        as *const objc2_app_kit::NSMenu)
+                })
+            } else {
+                None
+            }
+        }
+    }
+);
+
+#[cfg(target_os = "macos")]
+impl TrayInputOverlayView {
+    fn update_tray_rect(&self) {
+        update_native_tray_rect_from_window(&self.ivars().status_window);
+    }
+
+    fn open_context_menu(&self) {
+        self.update_tray_rect();
+        show_native_tray_menu(&self.ivars().status_item, &self.ivars().menu);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct TrayInputOverlaySyncState {
+    overlay_window: objc2::rc::Retained<objc2_app_kit::NSWindow>,
+    overlay_view: objc2::rc::Retained<TrayInputOverlayView>,
+    status_window: objc2::rc::Retained<objc2_app_kit::NSWindow>,
+}
+
+#[cfg(target_os = "macos")]
+fn install_tray_input_overlay(
+    app_handle: &AppHandle,
+    menu: &objc2_app_kit::NSMenu,
+    status_item: &objc2_app_kit::NSStatusItem,
+    status_window: &objc2_app_kit::NSWindow,
+) {
+    use objc2::ClassType;
+    use objc2_app_kit::{
+        NSBackingStoreType, NSColor, NSStatusWindowLevel, NSWindow, NSWindowCollectionBehavior,
+        NSWindowStyleMask,
+    };
+    use objc2_foundation::{NSPoint, NSRect};
+
+    let frame = tray_input_overlay_frame_from_status_window_frame(status_window.frame());
+    let overlay_window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            objc2_foundation::MainThreadMarker::new()
+                .expect("main thread")
+                .alloc(),
+            frame,
+            NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    unsafe {
+        overlay_window.setReleasedWhenClosed(false);
+    }
+    overlay_window.setOpaque(false);
+    overlay_window.setBackgroundColor(Some(&NSColor::clearColor()));
+    overlay_window.setIgnoresMouseEvents(false);
+    overlay_window.setLevel(NSStatusWindowLevel + 1);
+    overlay_window.setCollectionBehavior(
+        NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::Stationary
+            | NSWindowCollectionBehavior::IgnoresCycle
+            | NSWindowCollectionBehavior::FullScreenAuxiliary,
+    );
+
+    let overlay_view = unsafe {
+        let view = objc2_foundation::MainThreadMarker::new()
+            .expect("main thread")
+            .alloc()
+            .set_ivars(TrayInputOverlayViewIvars {
+                app_handle: app_handle.clone(),
+                menu: menu.retain(),
+                status_item: status_item.retain(),
+                status_window: status_window.retain(),
+            });
+        let view: objc2::rc::Retained<TrayInputOverlayView> = objc2::msg_send![
+            super(view),
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), frame.size)
+        ];
+        view
+    };
+    let overlay_ns_view: &objc2_app_kit::NSView = overlay_view.as_super();
+    overlay_ns_view.setAutoresizingMask(
+        objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
+            | objc2_app_kit::NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+    overlay_window.setContentView(Some(overlay_ns_view));
+    overlay_window.orderFrontRegardless();
+
+    install_tray_input_overlay_sync_timer(&overlay_window, &overlay_view, status_window);
+
+    std::mem::forget(overlay_window);
+    std::mem::forget(overlay_view);
+}
+
+#[cfg(target_os = "macos")]
+fn install_tray_input_overlay_sync_timer(
+    overlay_window: &objc2_app_kit::NSWindow,
+    overlay_view: &TrayInputOverlayView,
+    status_window: &objc2_app_kit::NSWindow,
+) {
+    use objc2::ClassType;
+    use objc2_foundation::{NSPoint, NSRect, NSTimer};
+    use std::ptr::NonNull;
+
+    let state = std::rc::Rc::new(TrayInputOverlaySyncState {
+        overlay_window: overlay_window.retain(),
+        overlay_view: overlay_view.retain(),
+        status_window: status_window.retain(),
+    });
+    let block_state = state.clone();
+    let block = block2::RcBlock::new(move |_timer: NonNull<NSTimer>| {
+        let frame =
+            tray_input_overlay_frame_from_status_window_frame(block_state.status_window.frame());
+        block_state.overlay_window.setFrame_display(frame, false);
+        let overlay_ns_view: &objc2_app_kit::NSView = block_state.overlay_view.as_super();
+        overlay_ns_view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
+    });
+    let block_ref: &block2::DynBlock<dyn Fn(NonNull<NSTimer>)> = &block;
+    let timer =
+        unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.25, true, block_ref) };
+
+    std::mem::forget(state);
+    std::mem::forget(block);
+    std::mem::forget(timer);
+}
+
+#[cfg(target_os = "macos")]
+fn tray_input_overlay_frame_from_status_window_frame(
+    frame: objc2_foundation::NSRect,
+) -> objc2_foundation::NSRect {
+    objc2_foundation::NSRect::new(
+        objc2_foundation::NSPoint::new(
+            frame.origin.x - STATUS_ITEM_HORIZONTAL_HIT_PADDING,
+            frame.origin.y - STATUS_ITEM_VERTICAL_HIT_PADDING,
+        ),
+        objc2_foundation::NSSize::new(
+            frame.size.width + (STATUS_ITEM_HORIZONTAL_HIT_PADDING * 2.0),
+            frame.size.height + (STATUS_ITEM_VERTICAL_HIT_PADDING * 2.0),
+        ),
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
 struct TraySecondaryClickPollState {
     menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
     status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
@@ -805,6 +1019,12 @@ fn install_status_item_event_tap(
         status_item,
         window,
         CGEventTapLocation::SessionEventTap,
+    );
+    install_status_item_event_tap_at_location(
+        menu,
+        status_item,
+        window,
+        CGEventTapLocation::AnnotatedSessionEventTap,
     );
 }
 
@@ -935,10 +1155,19 @@ fn should_open_tray_menu_from_cg_event_type(
 fn is_secondary_mouse_button_pressed() -> bool {
     use objc2_core_graphics::{CGEventSource, CGEventSourceStateID, CGMouseButton};
 
-    CGEventSource::button_state(
-        CGEventSourceStateID::CombinedSessionState,
-        CGMouseButton::Right,
-    ) || CGEventSource::button_state(CGEventSourceStateID::HIDSystemState, CGMouseButton::Right)
+    is_appkit_secondary_mouse_button_pressed(objc2_app_kit::NSEvent::pressedMouseButtons() as usize)
+        || CGEventSource::button_state(
+            CGEventSourceStateID::CombinedSessionState,
+            CGMouseButton::Right,
+        )
+        || CGEventSource::button_state(CGEventSourceStateID::HIDSystemState, CGMouseButton::Right)
+}
+
+#[cfg(target_os = "macos")]
+fn is_appkit_secondary_mouse_button_pressed(pressed_mouse_buttons: usize) -> bool {
+    const SECONDARY_MOUSE_BUTTON_MASK: usize = 1 << 1;
+
+    pressed_mouse_buttons & SECONDARY_MOUSE_BUTTON_MASK != 0
 }
 
 #[cfg(target_os = "macos")]
@@ -1048,6 +1277,10 @@ fn is_point_inside_rect_with_padding(
 #[cfg(target_os = "macos")]
 fn should_open_tray_menu_from_native_event(event: &objc2_app_kit::NSEvent) -> bool {
     should_open_tray_menu_from_native_event_type(event.r#type(), event.modifierFlags())
+        || should_open_tray_menu_from_trackpad_event_type(
+            event.r#type(),
+            objc2_app_kit::NSEvent::pressedMouseButtons() as usize,
+        )
 }
 
 #[cfg(target_os = "macos")]
@@ -1078,6 +1311,22 @@ fn should_open_tray_menu_from_native_event_type(
             && modifier_flags.contains(NSEventModifierFlags::Control))
         || (event_type == NSEventType::LeftMouseUp
             && modifier_flags.contains(NSEventModifierFlags::Control))
+}
+
+#[cfg(target_os = "macos")]
+fn should_open_tray_menu_from_trackpad_event_type(
+    event_type: objc2_app_kit::NSEventType,
+    pressed_mouse_buttons: usize,
+) -> bool {
+    use objc2_app_kit::NSEventType;
+
+    is_appkit_secondary_mouse_button_pressed(pressed_mouse_buttons)
+        && (event_type == NSEventType::SystemDefined
+            || event_type == NSEventType::Gesture
+            || event_type == NSEventType::BeginGesture
+            || event_type == NSEventType::EndGesture
+            || event_type == NSEventType::Pressure
+            || event_type == NSEventType::DirectTouch)
 }
 
 #[cfg(target_os = "macos")]
@@ -1280,6 +1529,32 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn tray_input_overlay_frame_expands_status_window_hit_area() {
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+        let frame = NSRect::new(NSPoint::new(100.0, 900.0), NSSize::new(24.0, 22.0));
+        let overlay = tray_input_overlay_frame_from_status_window_frame(frame);
+
+        assert_eq!(
+            overlay.origin.x,
+            frame.origin.x - STATUS_ITEM_HORIZONTAL_HIT_PADDING
+        );
+        assert_eq!(
+            overlay.origin.y,
+            frame.origin.y - STATUS_ITEM_VERTICAL_HIT_PADDING
+        );
+        assert_eq!(
+            overlay.size.width,
+            frame.size.width + (STATUS_ITEM_HORIZONTAL_HIT_PADDING * 2.0)
+        );
+        assert_eq!(
+            overlay.size.height,
+            frame.size.height + (STATUS_ITEM_VERTICAL_HIT_PADDING * 2.0)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn native_status_window_frame_converts_to_physical_tray_rect() {
         use objc2_foundation::{NSPoint, NSRect, NSSize};
 
@@ -1361,6 +1636,40 @@ mod tests {
         ));
         assert!(!should_open_tray_menu_from_polled_button_state(
             false, true, false
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn appkit_pressed_mouse_buttons_detect_secondary_click() {
+        assert!(!is_appkit_secondary_mouse_button_pressed(0));
+        assert!(!is_appkit_secondary_mouse_button_pressed(1 << 0));
+        assert!(is_appkit_secondary_mouse_button_pressed(1 << 1));
+        assert!(is_appkit_secondary_mouse_button_pressed(
+            (1 << 0) | (1 << 1)
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trackpad_events_open_only_when_secondary_button_is_pressed() {
+        use objc2_app_kit::NSEventType;
+
+        assert!(should_open_tray_menu_from_trackpad_event_type(
+            NSEventType::DirectTouch,
+            1 << 1
+        ));
+        assert!(should_open_tray_menu_from_trackpad_event_type(
+            NSEventType::SystemDefined,
+            1 << 1
+        ));
+        assert!(!should_open_tray_menu_from_trackpad_event_type(
+            NSEventType::DirectTouch,
+            0
+        ));
+        assert!(!should_open_tray_menu_from_trackpad_event_type(
+            NSEventType::MouseMoved,
+            1 << 1
         ));
     }
 }
