@@ -1,7 +1,7 @@
 use std::ffi::CString;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use objc2::Message;
 use objc2_app_kit::{NSMenu, NSStatusItem, NSView};
@@ -9,40 +9,13 @@ use objc2_app_kit::{NSMenu, NSStatusItem, NSView};
 type MTDeviceRef = *mut libc::c_void;
 type CFArrayRef = *const libc::c_void;
 type CFIndex = isize;
-#[repr(C)]
-struct MTPoint {
-    _x: f32,
-    _y: f32,
-}
-
-#[repr(C)]
-struct MTVector {
-    _position: MTPoint,
-    _velocity: MTPoint,
-}
-
-#[repr(C)]
-struct MTTouch {
-    _frame: i32,
-    _timestamp: f64,
-    _path_index: i32,
-    state: i32,
-    _finger_id: i32,
-    _hand_id: i32,
-    _normalized: MTVector,
-    z_total: f32,
-    _field_9: i32,
-    _angle: f32,
-    _major_axis: f32,
-    _minor_axis: f32,
-    _absolute: MTVector,
-    _field_14: i32,
-    _field_15: i32,
-    z_density: f32,
-}
-
-type MTContactCallback =
-    unsafe extern "C" fn(MTDeviceRef, *mut MTTouch, usize, libc::c_double, usize);
+type MTContactCallback = unsafe extern "C" fn(
+    libc::c_int,
+    *mut libc::c_void,
+    libc::c_int,
+    libc::c_double,
+    libc::c_int,
+) -> libc::c_int;
 type MTDeviceCreateDefault = unsafe extern "C" fn() -> MTDeviceRef;
 type MTDeviceCreateList = unsafe extern "C" fn() -> CFArrayRef;
 type MTRegisterContactFrameCallback = unsafe extern "C" fn(MTDeviceRef, MTContactCallback);
@@ -50,6 +23,7 @@ type MTDeviceStart = unsafe extern "C" fn(MTDeviceRef, libc::c_int);
 
 const MULTITOUCH_FRAMEWORK_PATH: &str =
     "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport";
+const RAW_TRACKPAD_IDLE_END_MILLIS: u64 = 160;
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
@@ -60,6 +34,7 @@ unsafe extern "C" {
 #[derive(Debug)]
 struct RawTrackpadTouchState {
     active_fingers: AtomicUsize,
+    last_update_millis: AtomicU64,
     runtime_started: AtomicBool,
 }
 
@@ -67,6 +42,7 @@ impl RawTrackpadTouchState {
     fn new() -> Self {
         Self {
             active_fingers: AtomicUsize::new(0),
+            last_update_millis: AtomicU64::new(0),
             runtime_started: AtomicBool::new(false),
         }
     }
@@ -147,10 +123,7 @@ fn install_raw_trackpad_menu_timer(
     });
     let block_state = state.clone();
     let block = block2::RcBlock::new(move |_timer: NonNull<NSTimer>| {
-        let active_fingers = block_state
-            .touch_state
-            .active_fingers
-            .load(Ordering::SeqCst);
+        let active_fingers = current_raw_active_fingers(&block_state.touch_state);
         let two_finger_is_active = active_fingers >= 2;
         let cursor_inside_status_view =
             crate::tray::is_mouse_inside_status_view(&block_state.status_view);
@@ -290,44 +263,60 @@ fn dl_error() -> String {
 }
 
 unsafe extern "C" fn raw_trackpad_contact_callback(
-    _device: MTDeviceRef,
-    touches: *mut MTTouch,
-    touch_count: usize,
+    _device: libc::c_int,
+    _touches: *mut libc::c_void,
+    active_fingers: libc::c_int,
     _timestamp: libc::c_double,
-    _frame: usize,
-) {
+    _frame: libc::c_int,
+) -> libc::c_int {
     if let Some(state) = RAW_TRACKPAD_TOUCH_STATE.get() {
-        let active_fingers = raw_active_touch_count(touches, touch_count);
+        let active_fingers = active_fingers.max(0) as usize;
         let previous = state.active_fingers.swap(active_fingers, Ordering::SeqCst);
+        state
+            .last_update_millis
+            .store(raw_trackpad_elapsed_millis(), Ordering::SeqCst);
         if previous != active_fingers {
-            log::debug!(
-                "tray context menu: raw trackpad active_fingers={active_fingers} touch_count={touch_count}"
-            );
+            log::debug!("tray context menu: raw trackpad active_fingers={active_fingers}");
         }
     }
+
+    0
 }
 
-fn raw_active_touch_count(touches: *const MTTouch, touch_count: usize) -> usize {
-    if touches.is_null() {
-        return touch_count;
+fn current_raw_active_fingers(state: &RawTrackpadTouchState) -> usize {
+    let active_fingers = state.active_fingers.load(Ordering::SeqCst);
+    if active_fingers < 2 {
+        return active_fingers;
     }
 
-    let touching_count = (0..touch_count)
-        .filter(|index| {
-            let touch = unsafe { &*touches.add(*index) };
-            raw_touch_is_active(touch.state, touch.z_total, touch.z_density)
-        })
-        .count();
-
-    if touching_count > 0 {
-        touching_count
-    } else {
-        touch_count
+    if raw_trackpad_update_is_stale(
+        raw_trackpad_elapsed_millis(),
+        state.last_update_millis.load(Ordering::SeqCst),
+        RAW_TRACKPAD_IDLE_END_MILLIS,
+    ) {
+        state.active_fingers.store(0, Ordering::SeqCst);
+        return 0;
     }
+
+    active_fingers
 }
 
-fn raw_touch_is_active(state: i32, z_total: f32, z_density: f32) -> bool {
-    matches!(state, 3 | 4) || z_total > 0.0 || z_density > 0.0
+fn raw_trackpad_update_is_stale(
+    now_millis: u64,
+    last_update_millis: u64,
+    max_age_millis: u64,
+) -> bool {
+    last_update_millis > 0 && now_millis.saturating_sub(last_update_millis) >= max_age_millis
+}
+
+fn raw_trackpad_elapsed_millis() -> u64 {
+    static STARTED_AT: OnceLock<std::time::Instant> = OnceLock::new();
+    STARTED_AT
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn should_open_raw_trackpad_menu_on_sequence_end(
@@ -359,59 +348,9 @@ mod tests {
     }
 
     #[test]
-    fn raw_touch_count_prefers_active_touch_states() {
-        let touches = [
-            MTTouch {
-                _frame: 0,
-                _timestamp: 0.0,
-                _path_index: 0,
-                state: 2,
-                _finger_id: 0,
-                _hand_id: 0,
-                _normalized: MTVector {
-                    _position: MTPoint { _x: 0.0, _y: 0.0 },
-                    _velocity: MTPoint { _x: 0.0, _y: 0.0 },
-                },
-                z_total: 0.0,
-                _field_9: 0,
-                _angle: 0.0,
-                _major_axis: 0.0,
-                _minor_axis: 0.0,
-                _absolute: MTVector {
-                    _position: MTPoint { _x: 0.0, _y: 0.0 },
-                    _velocity: MTPoint { _x: 0.0, _y: 0.0 },
-                },
-                _field_14: 0,
-                _field_15: 0,
-                z_density: 0.0,
-            },
-            MTTouch {
-                _frame: 0,
-                _timestamp: 0.0,
-                _path_index: 0,
-                state: 4,
-                _finger_id: 1,
-                _hand_id: 0,
-                _normalized: MTVector {
-                    _position: MTPoint { _x: 0.0, _y: 0.0 },
-                    _velocity: MTPoint { _x: 0.0, _y: 0.0 },
-                },
-                z_total: 0.0,
-                _field_9: 0,
-                _angle: 0.0,
-                _major_axis: 0.0,
-                _minor_axis: 0.0,
-                _absolute: MTVector {
-                    _position: MTPoint { _x: 0.0, _y: 0.0 },
-                    _velocity: MTPoint { _x: 0.0, _y: 0.0 },
-                },
-                _field_14: 0,
-                _field_15: 0,
-                z_density: 0.0,
-            },
-        ];
-
-        assert_eq!(raw_active_touch_count(touches.as_ptr(), touches.len()), 1);
-        assert_eq!(raw_active_touch_count(std::ptr::null(), 2), 2);
+    fn stale_raw_trackpad_update_ends_two_finger_sequence() {
+        assert!(!raw_trackpad_update_is_stale(100, 0, 160));
+        assert!(!raw_trackpad_update_is_stale(259, 100, 160));
+        assert!(raw_trackpad_update_is_stale(260, 100, 160));
     }
 }
