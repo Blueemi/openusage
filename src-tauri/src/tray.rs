@@ -331,6 +331,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
             unsafe {
                 menu.show_context_menu_for_nsview(view, None);
             }
+            button.highlight(false);
 
             ptr::null_mut()
         });
