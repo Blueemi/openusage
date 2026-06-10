@@ -3318,9 +3318,11 @@ version = "0.6.27"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
+ "block2",
  "dirs 6.0.0",
  "libc",
  "log",
+ "muda",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
