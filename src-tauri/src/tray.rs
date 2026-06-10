@@ -339,6 +339,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         set_context_menu_on_view_tree(button_view, ns_menu);
         update_native_tray_rect_from_view(button_view);
         install_status_button_action_target(ns_menu, &status_item, &button);
+        install_status_view_context_click_gestures(ns_menu, &status_item, button_view);
 
         let Some(window) = button.window() else {
             log::warn!("tray context menu: status item window unavailable");
@@ -476,6 +477,20 @@ objc2::define_class!(
 
             show_native_tray_menu(&ivars.status_item, &ivars.menu);
         }
+
+        #[unsafe(method(openOpenUsageTrayContextMenuFromClickGesture:))]
+        fn open_context_menu_from_click_gesture(
+            &self,
+            recognizer: &objc2_app_kit::NSClickGestureRecognizer,
+        ) {
+            log::debug!(
+                "tray context menu: status view click gesture button_mask={} touches={}",
+                recognizer.buttonMask(),
+                recognizer.numberOfTouchesRequired()
+            );
+            let ivars = self.ivars();
+            show_native_tray_menu(&ivars.status_item, &ivars.menu);
+        }
     }
 );
 
@@ -513,6 +528,115 @@ fn install_status_button_action_target(
     // NSControl's target is weak, so keep the action bridge alive for the app lifetime.
     std::mem::forget(target_object);
     log::debug!("tray context menu: installed status button action target");
+}
+
+#[cfg(target_os = "macos")]
+fn install_status_view_context_click_gestures(
+    menu: &objc2_app_kit::NSMenu,
+    status_item: &objc2_app_kit::NSStatusItem,
+    status_view: &objc2_app_kit::NSView,
+) {
+    let target = TrayStatusButtonActionTarget::new(menu, status_item);
+    install_status_view_context_click_gestures_with_target(status_view, &target);
+    let target_object: objc2::rc::Retained<objc2::runtime::AnyObject> = target.into();
+
+    // NSGestureRecognizer targets are weak.
+    std::mem::forget(target_object);
+    log::debug!("tray context menu: installed status view click gestures");
+}
+
+#[cfg(target_os = "macos")]
+fn install_status_view_context_click_gestures_with_target(
+    view: &objc2_app_kit::NSView,
+    target: &TrayStatusButtonActionTarget,
+) {
+    use objc2_app_kit::NSTouchTypeMask;
+
+    view.setWantsRestingTouches(true);
+    view.setAllowedTouchTypes(NSTouchTypeMask::Indirect);
+    install_status_view_context_click_gestures_on_view(view, target);
+
+    for subview in view.subviews() {
+        install_status_view_context_click_gestures_with_target(&subview, target);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_status_view_context_click_gestures_on_view(
+    view: &objc2_app_kit::NSView,
+    target: &TrayStatusButtonActionTarget,
+) {
+    use objc2::ClassType;
+    use objc2_app_kit::{NSClickGestureRecognizer, NSGestureRecognizer};
+
+    let Some(mtm) = objc2_foundation::MainThreadMarker::new() else {
+        log::warn!("tray context menu: cannot install click gesture off main thread");
+        return;
+    };
+    let target: &objc2::runtime::AnyObject =
+        unsafe { &*(target as *const TrayStatusButtonActionTarget).cast() };
+
+    let secondary_click = NSClickGestureRecognizer::new(mtm);
+    configure_status_view_context_click_gesture(
+        &secondary_click,
+        target,
+        secondary_click_button_mask(),
+        1,
+        false,
+        true,
+    );
+    let secondary_click: &NSGestureRecognizer = secondary_click.as_super();
+    view.addGestureRecognizer(secondary_click);
+
+    let two_touch_click = NSClickGestureRecognizer::new(mtm);
+    configure_status_view_context_click_gesture(
+        &two_touch_click,
+        target,
+        primary_click_button_mask(),
+        2,
+        true,
+        false,
+    );
+    let two_touch_click: &NSGestureRecognizer = two_touch_click.as_super();
+    view.addGestureRecognizer(two_touch_click);
+}
+
+#[cfg(target_os = "macos")]
+fn configure_status_view_context_click_gesture(
+    recognizer: &objc2_app_kit::NSClickGestureRecognizer,
+    target: &objc2::runtime::AnyObject,
+    button_mask: objc2_foundation::NSUInteger,
+    touch_count: objc2_foundation::NSInteger,
+    delay_primary: bool,
+    delay_secondary: bool,
+) {
+    use objc2::ClassType;
+    use objc2_app_kit::NSGestureRecognizer;
+
+    recognizer.setButtonMask(button_mask);
+    recognizer.setNumberOfClicksRequired(1);
+    recognizer.setNumberOfTouchesRequired(touch_count);
+
+    let gesture: &NSGestureRecognizer = recognizer.as_super();
+    unsafe {
+        gesture.setTarget(Some(target));
+        gesture.setAction(Some(objc2::sel!(
+            openOpenUsageTrayContextMenuFromClickGesture:
+        )));
+    }
+    gesture.setDelaysPrimaryMouseButtonEvents(delay_primary);
+    gesture.setDelaysSecondaryMouseButtonEvents(delay_secondary);
+    gesture.setDelaysOtherMouseButtonEvents(false);
+}
+
+#[cfg(target_os = "macos")]
+fn primary_click_button_mask() -> objc2_foundation::NSUInteger {
+    1 << 0
+}
+
+#[cfg(target_os = "macos")]
+fn secondary_click_button_mask() -> objc2_foundation::NSUInteger {
+    1 << 1
 }
 
 #[cfg(target_os = "macos")]
@@ -1224,6 +1348,13 @@ mod tests {
         assert!(mask.contains(NSEventMask::OtherMouseUp));
         assert!(mask.contains(NSEventMask::LeftMouseDown));
         assert!(mask.contains(NSEventMask::LeftMouseUp));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn status_view_click_gesture_masks_match_mouse_buttons() {
+        assert_eq!(primary_click_button_mask(), 1 << 0);
+        assert_eq!(secondary_click_button_mask(), 1 << 1);
     }
 
     #[cfg(target_os = "macos")]
