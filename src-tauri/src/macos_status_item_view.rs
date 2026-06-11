@@ -155,15 +155,10 @@ objc2::define_class!(
 
         #[unsafe(method(menuForEvent:))]
         fn menu_for_event(&self, event: &NSEvent) -> Option<&'static NSMenu> {
-            if self.should_open_context_menu_from_event(event) {
-                self.log_event("menuForEvent", event);
-                self.ivars().suppress_next_mouse_up.set(true);
-                self.open_context_menu_for_event(event);
-            } else {
-                self.log_event("menuForEventIgnored", event);
-            }
-
-            None
+            self.update_tray_rect();
+            self.log_event("menuForEvent", event);
+            self.ivars().suppress_next_mouse_up.set(true);
+            retained_menu_as_static_ref(&self.ivars().menu)
         }
 
         #[unsafe(method(openOpenUsageContextMenuFromGesture:))]
@@ -326,6 +321,11 @@ fn should_open_from_touch_count(menu_open_for_current_touch: bool, touch_count: 
 
 fn should_reset_touch_gate(touch_count: usize) -> bool {
     touch_count < 2
+}
+
+fn retained_menu_as_static_ref(menu: &objc2::rc::Retained<NSMenu>) -> Option<&'static NSMenu> {
+    let menu: &NSMenu = menu;
+    Some(unsafe { &*(menu as *const NSMenu) })
 }
 
 fn normalized_status_item_size(size: NSSize) -> NSSize {

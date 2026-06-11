@@ -1068,15 +1068,10 @@ objc2::define_class!(
             &self,
             event: &objc2_app_kit::NSEvent,
         ) -> Option<&'static objc2_app_kit::NSMenu> {
-            if self.should_open_context_menu_from_event(event) {
-                self.log_event("menuForEvent", event);
-                self.ivars().suppress_next_mouse_up.set(true);
-                self.open_context_menu_for_event(event);
-            } else {
-                self.log_event("menuForEventIgnored", event);
-            }
-
-            None
+            self.update_tray_rect();
+            self.log_event("menuForEvent", event);
+            self.ivars().suppress_next_mouse_up.set(true);
+            retained_tray_menu_as_static_ref(&self.ivars().menu)
         }
     }
 );
@@ -1472,6 +1467,14 @@ fn should_open_tray_menu_from_touch_count(
 #[cfg(target_os = "macos")]
 fn should_reset_touch_menu_gate(touch_count: usize) -> bool {
     touch_count < 2
+}
+
+#[cfg(target_os = "macos")]
+fn retained_tray_menu_as_static_ref(
+    menu: &objc2::rc::Retained<objc2_app_kit::NSMenu>,
+) -> Option<&'static objc2_app_kit::NSMenu> {
+    let menu: &objc2_app_kit::NSMenu = menu;
+    Some(unsafe { &*(menu as *const objc2_app_kit::NSMenu) })
 }
 
 #[cfg(target_os = "macos")]
