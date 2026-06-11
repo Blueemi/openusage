@@ -338,10 +338,11 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
             }
         };
         let ns_menu = unsafe { &*(menu.ns_menu().cast::<NSMenu>()) };
-        status_item.setMenu(None);
+        status_item.setMenu(Some(ns_menu));
         let local_ns_menu = ns_menu.retain();
         let local_status_item = status_item.retain();
         let button_view: &NSView = button.as_super().as_super().as_super();
+        let local_status_view = button_view.retain();
         set_context_menu_on_view_tree(button_view, ns_menu);
         update_native_tray_rect_from_view(button_view);
         install_status_button_action_target(ns_menu, &status_item, &button);
@@ -364,11 +365,22 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         log::debug!("tray context menu: installed on status button view tree");
 
         let last_event_number = Cell::new(-1);
+        let local_app_handle = app_handle.clone();
         let block = block2::RcBlock::new(move |event_ptr: NonNull<NSEvent>| -> *mut NSEvent {
             let event = unsafe { event_ptr.as_ref() };
-            if event.windowNumber() != status_window_number
-                || !should_open_tray_menu_from_native_event(event)
-            {
+            if event.windowNumber() != status_window_number {
+                return event_ptr.as_ptr();
+            }
+
+            if should_handle_primary_status_item_click(event) {
+                if event.r#type() == objc2_app_kit::NSEventType::LeftMouseUp {
+                    update_native_tray_rect_from_view(&local_status_view);
+                    toggle_panel(&local_app_handle);
+                }
+                return ptr::null_mut();
+            }
+
+            if !should_open_tray_menu_from_native_event(event) {
                 return event_ptr.as_ptr();
             }
 
@@ -695,6 +707,28 @@ fn should_open_tray_menu_from_status_button_action_event_details(
 }
 
 #[cfg(target_os = "macos")]
+fn should_handle_primary_status_item_click(event: &objc2_app_kit::NSEvent) -> bool {
+    should_handle_primary_status_item_click_details(
+        event.r#type(),
+        event.modifierFlags(),
+        event.buttonNumber(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn should_handle_primary_status_item_click_details(
+    event_type: objc2_app_kit::NSEventType,
+    modifier_flags: objc2_app_kit::NSEventModifierFlags,
+    button_number: isize,
+) -> bool {
+    use objc2_app_kit::{NSEventModifierFlags, NSEventType};
+
+    (event_type == NSEventType::LeftMouseDown || event_type == NSEventType::LeftMouseUp)
+        && button_number == 0
+        && !modifier_flags.contains(NSEventModifierFlags::Control)
+}
+
+#[cfg(target_os = "macos")]
 fn update_native_tray_rect_from_view(view: &objc2_app_kit::NSView) {
     let Some(screen_frame) = status_view_screen_frame(view) else {
         return;
@@ -787,7 +821,7 @@ objc2::define_class!(
             self.update_tray_rect();
             if self.should_open_context_menu_from_event(event) {
                 self.ivars().suppress_next_mouse_up.set(true);
-                self.open_context_menu();
+                self.open_context_menu_for_event(event);
             }
         }
 
@@ -796,39 +830,39 @@ objc2::define_class!(
             self.update_tray_rect();
             if self.should_open_context_menu_from_event(event) {
                 self.ivars().suppress_next_mouse_up.set(false);
-                self.open_context_menu();
+                self.open_context_menu_for_event(event);
                 return;
             }
 
             match overlay_mouse_up_action(self.ivars().suppress_next_mouse_up.replace(false), event)
             {
                 TrayOverlayMouseUpAction::Ignore => {}
-                TrayOverlayMouseUpAction::OpenMenu => self.open_context_menu(),
+                TrayOverlayMouseUpAction::OpenMenu => self.open_context_menu_for_event(event),
                 TrayOverlayMouseUpAction::TogglePanel => toggle_panel(&self.ivars().app_handle),
             }
         }
 
         #[unsafe(method(rightMouseDown:))]
-        fn right_mouse_down(&self, _event: &objc2_app_kit::NSEvent) {
-            self.open_context_menu();
+        fn right_mouse_down(&self, event: &objc2_app_kit::NSEvent) {
+            self.open_context_menu_for_event(event);
         }
 
         #[unsafe(method(rightMouseUp:))]
-        fn right_mouse_up(&self, _event: &objc2_app_kit::NSEvent) {
-            self.open_context_menu();
+        fn right_mouse_up(&self, event: &objc2_app_kit::NSEvent) {
+            self.open_context_menu_for_event(event);
         }
 
         #[unsafe(method(otherMouseDown:))]
         fn other_mouse_down(&self, event: &objc2_app_kit::NSEvent) {
             if event.buttonNumber() > 0 {
-                self.open_context_menu();
+                self.open_context_menu_for_event(event);
             }
         }
 
         #[unsafe(method(otherMouseUp:))]
         fn other_mouse_up(&self, event: &objc2_app_kit::NSEvent) {
             if event.buttonNumber() > 0 {
-                self.open_context_menu();
+                self.open_context_menu_for_event(event);
             }
         }
 
@@ -887,6 +921,20 @@ impl TrayInputOverlayView {
         show_native_tray_menu(&self.ivars().status_item, &self.ivars().menu);
     }
 
+    fn open_context_menu_for_event(&self, event: &objc2_app_kit::NSEvent) {
+        self.update_tray_rect();
+        if should_skip_recent_native_menu_open(std::time::Instant::now()) {
+            return;
+        }
+
+        log::debug!("tray context menu: showing native context menu for event");
+        objc2_app_kit::NSMenu::popUpContextMenu_withEvent_forView(
+            &self.ivars().menu,
+            event,
+            self.as_view(),
+        );
+    }
+
     fn handle_touch_event(&self, event: &objc2_app_kit::NSEvent) {
         let touch_count = active_touch_count_for_event(event, self.as_view());
         if should_open_tray_menu_from_touch_count(
@@ -921,6 +969,7 @@ fn install_tray_input_view(
     status_view: &objc2_app_kit::NSView,
 ) {
     use objc2::ClassType;
+    use objc2_app_kit::NSWindowOrderingMode;
     use objc2_foundation::{NSPoint, NSRect};
 
     let Some(mtm) = objc2_foundation::MainThreadMarker::new() else {
@@ -950,7 +999,12 @@ fn install_tray_input_view(
         objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
             | objc2_app_kit::NSAutoresizingMaskOptions::ViewHeightSizable,
     );
-    status_view.addSubview(overlay_ns_view);
+    overlay_ns_view.setFrame(status_view.bounds());
+    status_view.addSubview_positioned_relativeTo(
+        overlay_ns_view,
+        NSWindowOrderingMode::Above,
+        None,
+    );
 
     std::mem::forget(overlay_view);
     log::warn!("tray context menu: installed embedded input view");
@@ -1775,6 +1829,33 @@ mod tests {
                 0
             )
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn primary_status_item_click_intercept_keeps_context_clicks_available() {
+        use objc2_app_kit::{NSEventModifierFlags, NSEventType};
+
+        assert!(should_handle_primary_status_item_click_details(
+            NSEventType::LeftMouseDown,
+            NSEventModifierFlags::empty(),
+            0
+        ));
+        assert!(should_handle_primary_status_item_click_details(
+            NSEventType::LeftMouseUp,
+            NSEventModifierFlags::empty(),
+            0
+        ));
+        assert!(!should_handle_primary_status_item_click_details(
+            NSEventType::LeftMouseDown,
+            NSEventModifierFlags::Control,
+            0
+        ));
+        assert!(!should_handle_primary_status_item_click_details(
+            NSEventType::LeftMouseDown,
+            NSEventModifierFlags::empty(),
+            1
+        ));
     }
 
     #[cfg(target_os = "macos")]
