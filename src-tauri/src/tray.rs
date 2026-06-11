@@ -373,7 +373,9 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
             std::mem::forget(menu);
             return;
         };
-        install_tray_input_overlay_window(&app_handle, ns_menu, status_view);
+        if should_install_tray_input_overlay_window(installed_custom_status_view) {
+            install_tray_input_overlay_window(&app_handle, ns_menu, status_view);
+        }
 
         let status_window_number = window.windowNumber();
         let global_ns_menu = ns_menu.retain();
@@ -1235,6 +1237,11 @@ fn install_tray_input_overlay_window(
     std::mem::forget(window);
     std::mem::forget(overlay_view);
     log::warn!("tray context menu: installed status-bar input overlay window");
+}
+
+#[cfg(target_os = "macos")]
+fn should_install_tray_input_overlay_window(installed_custom_status_view: bool) -> bool {
+    !installed_custom_status_view
 }
 
 #[cfg(target_os = "macos")]
@@ -2563,6 +2570,13 @@ mod tests {
     fn tray_input_overlay_window_sits_above_status_item_level() {
         assert!(tray_input_overlay_window_level() > objc2_app_kit::NSStatusWindowLevel);
         assert!(tray_input_overlay_window_level() < objc2_app_kit::NSPopUpMenuWindowLevel);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tray_input_overlay_window_is_skipped_for_custom_status_view() {
+        assert!(!should_install_tray_input_overlay_window(true));
+        assert!(should_install_tray_input_overlay_window(false));
     }
 
     #[cfg(target_os = "macos")]
