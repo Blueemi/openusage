@@ -353,15 +353,23 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         let status_view = button_view.retain();
         let status_view: &NSView = &status_view;
         set_context_menu_on_view_tree(status_view, ns_menu);
+        accept_indirect_touch_events(status_view);
         update_native_tray_rect_from_view(status_view);
-        install_status_item_system_menu(&app_handle, ns_menu, &status_item, status_view);
+        status_item.setMenu(None);
+        install_status_button_action_target(
+            &app_handle,
+            ns_menu,
+            &status_item,
+            &button,
+            status_view,
+        );
         install_status_item_event_tap(ns_menu, status_view);
         install_secondary_click_poll_timer(ns_menu, status_view);
         crate::macos_hid_secondary_click::install(ns_menu, status_view);
         crate::macos_trackpad::install_context_click_fallback(ns_menu, status_view);
-        log::debug!("tray context menu: using AppKit status menu without overlay");
+        log::debug!("tray context menu: using status button actions without overlay");
 
-        // NSStatusItem keeps the menu, and NSMenu keeps a weak delegate.
+        // Keep the muda menu alive for manually popped AppKit menu actions.
         std::mem::forget(menu);
     }) {
         log::warn!("tray context menu: failed to install native menu: {error}");
@@ -458,9 +466,12 @@ fn install_status_item_system_menu(
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct TrayStatusButtonActionTargetIvars {
+    app_handle: AppHandle,
     menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
     status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
+    status_view: objc2::rc::Retained<objc2_app_kit::NSView>,
     last_event_number: std::cell::Cell<isize>,
+    two_touch_menu_open: std::cell::Cell<bool>,
 }
 
 #[cfg(target_os = "macos")]
@@ -485,15 +496,47 @@ objc2::define_class!(
             };
 
             log::debug!(
-                "tray context menu: status button action event_type={:?} event_number={}",
+                "tray context menu: status button action event_type={:?} event_number={} button={} touches={}",
                 event.r#type(),
-                event.eventNumber()
+                event.eventNumber(),
+                event.buttonNumber(),
+                active_touch_count_for_event(&event, &self.ivars().status_view)
             );
+
+            let ivars = self.ivars();
+            let touch_count = active_touch_count_for_event(&event, &ivars.status_view);
+            if should_open_tray_menu_from_touch_count(ivars.two_touch_menu_open.get(), touch_count)
+            {
+                ivars.two_touch_menu_open.set(true);
+                log::debug!(
+                    "tray context menu: status button action opening from two touches"
+                );
+                show_native_tray_menu(&ivars.status_item, &ivars.menu);
+                return;
+            }
+            if should_reset_touch_menu_gate(touch_count) {
+                ivars.two_touch_menu_open.set(false);
+            }
+
+            if should_handle_primary_status_item_click(&event) {
+                match primary_status_item_click_action(
+                    &event,
+                    native_menu_recently_opened_for_mouse_up(std::time::Instant::now()),
+                ) {
+                    PrimaryStatusItemClickAction::TogglePanel => {
+                        update_native_tray_rect_from_view(&ivars.status_view);
+                        toggle_panel(&ivars.app_handle);
+                    }
+                    PrimaryStatusItemClickAction::Ignore => {}
+                    PrimaryStatusItemClickAction::PassThrough => {}
+                }
+                return;
+            }
+
             if !should_open_tray_menu_from_status_button_action_event(&event) {
                 return;
             }
 
-            let ivars = self.ivars();
             let event_number = event.eventNumber();
             if event_number != 0 && event_number == ivars.last_event_number.get() {
                 return;
@@ -522,13 +565,18 @@ objc2::define_class!(
 #[cfg(target_os = "macos")]
 impl TrayStatusButtonActionTarget {
     fn new(
+        app_handle: &AppHandle,
         menu: &objc2_app_kit::NSMenu,
         status_item: &objc2_app_kit::NSStatusItem,
+        status_view: &objc2_app_kit::NSView,
     ) -> objc2::rc::Retained<Self> {
         let this = Self::alloc().set_ivars(TrayStatusButtonActionTargetIvars {
+            app_handle: app_handle.clone(),
             menu: menu.retain(),
             status_item: status_item.retain(),
+            status_view: status_view.retain(),
             last_event_number: std::cell::Cell::new(-1),
+            two_touch_menu_open: std::cell::Cell::new(false),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -536,11 +584,13 @@ impl TrayStatusButtonActionTarget {
 
 #[cfg(target_os = "macos")]
 fn install_status_button_action_target(
+    app_handle: &AppHandle,
     menu: &objc2_app_kit::NSMenu,
     status_item: &objc2_app_kit::NSStatusItem,
     button: &objc2_app_kit::NSStatusBarButton,
+    status_view: &objc2_app_kit::NSView,
 ) {
-    let target = TrayStatusButtonActionTarget::new(menu, status_item);
+    let target = TrayStatusButtonActionTarget::new(app_handle, menu, status_item, status_view);
     let target_object: objc2::rc::Retained<objc2::runtime::AnyObject> = target.into();
     let control: &objc2_app_kit::NSControl = button.as_super().as_super();
 
@@ -557,11 +607,12 @@ fn install_status_button_action_target(
 
 #[cfg(target_os = "macos")]
 fn install_status_view_context_click_gestures(
+    app_handle: &AppHandle,
     menu: &objc2_app_kit::NSMenu,
     status_item: &objc2_app_kit::NSStatusItem,
     status_view: &objc2_app_kit::NSView,
 ) {
-    let target = TrayStatusButtonActionTarget::new(menu, status_item);
+    let target = TrayStatusButtonActionTarget::new(app_handle, menu, status_item, status_view);
     install_status_view_context_click_gestures_with_target(status_view, &target);
     let target_object: objc2::rc::Retained<objc2::runtime::AnyObject> = target.into();
 
