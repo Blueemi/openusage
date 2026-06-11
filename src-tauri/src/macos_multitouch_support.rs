@@ -9,9 +9,9 @@ type CFStringRef = *const libc::c_void;
 pub(crate) type MTContactCallback = unsafe extern "C" fn(
     MTDeviceRef,
     *mut libc::c_void,
-    usize,
+    libc::c_int,
     libc::c_double,
-    usize,
+    libc::c_int,
 ) -> libc::c_int;
 type MTDeviceCreateDefault = unsafe extern "C" fn() -> MTDeviceRef;
 type MTDeviceCreateList = unsafe extern "C" fn() -> CFArrayRef;
