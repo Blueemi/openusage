@@ -7,7 +7,11 @@ use objc2_app_kit::{
     NSStatusItem, NSView,
 };
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tauri::AppHandle;
+
+const MAX_STATUS_VIEW_EVENT_LOGS: usize = 24;
+static STATUS_VIEW_EVENT_LOGS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
 struct OpenUsageStatusItemViewIvars {
@@ -39,6 +43,7 @@ objc2::define_class!(
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
             self.update_tray_rect();
+            self.log_event("mouseDown", event);
             if self.should_open_context_menu_from_event(event) {
                 self.ivars().suppress_next_mouse_up.set(true);
                 self.open_context_menu_for_event(event);
@@ -48,6 +53,7 @@ objc2::define_class!(
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, event: &NSEvent) {
             self.update_tray_rect();
+            self.log_event("mouseUp", event);
             if self.ivars().suppress_next_mouse_up.replace(false) {
                 return;
             }
@@ -62,18 +68,21 @@ objc2::define_class!(
 
         #[unsafe(method(rightMouseDown:))]
         fn right_mouse_down(&self, event: &NSEvent) {
+            self.log_event("rightMouseDown", event);
             self.ivars().suppress_next_mouse_up.set(true);
             self.open_context_menu_for_event(event);
         }
 
         #[unsafe(method(rightMouseUp:))]
         fn right_mouse_up(&self, event: &NSEvent) {
+            self.log_event("rightMouseUp", event);
             self.ivars().suppress_next_mouse_up.set(true);
             self.open_context_menu_for_event(event);
         }
 
         #[unsafe(method(otherMouseDown:))]
         fn other_mouse_down(&self, event: &NSEvent) {
+            self.log_event("otherMouseDown", event);
             if event.buttonNumber() > 0 {
                 self.ivars().suppress_next_mouse_up.set(true);
                 self.open_context_menu_for_event(event);
@@ -82,6 +91,7 @@ objc2::define_class!(
 
         #[unsafe(method(otherMouseUp:))]
         fn other_mouse_up(&self, event: &NSEvent) {
+            self.log_event("otherMouseUp", event);
             if event.buttonNumber() > 0 {
                 self.ivars().suppress_next_mouse_up.set(true);
                 self.open_context_menu_for_event(event);
@@ -146,13 +156,14 @@ objc2::define_class!(
         #[unsafe(method(menuForEvent:))]
         fn menu_for_event(&self, event: &NSEvent) -> Option<&'static NSMenu> {
             if self.should_open_context_menu_from_event(event) {
-                self.update_tray_rect();
-                Some(unsafe {
-                    &*(objc2::rc::Retained::as_ptr(&self.ivars().menu) as *const NSMenu)
-                })
+                self.log_event("menuForEvent", event);
+                self.ivars().suppress_next_mouse_up.set(true);
+                self.open_context_menu_for_event(event);
             } else {
-                None
+                self.log_event("menuForEventIgnored", event);
             }
+
+            None
         }
     }
 );
@@ -168,7 +179,12 @@ impl OpenUsageStatusItemView {
 
     fn open_context_menu_for_event(&self, event: &NSEvent) {
         self.update_tray_rect();
-        crate::tray::show_native_tray_menu_for_event(&self.ivars().menu, event, self.as_view());
+        log::warn!(
+            "tray context menu: custom status view opening menu event_type={:?} button={}",
+            event.r#type(),
+            event.buttonNumber()
+        );
+        crate::tray::show_native_tray_menu_at_view(&self.ivars().menu, self.as_view());
     }
 
     fn handle_touch_event(&self, event: &NSEvent) {
@@ -193,6 +209,21 @@ impl OpenUsageStatusItemView {
                 self.ivars().two_touch_menu_open.get(),
                 active_touch_count_for_event(event, self.as_view()),
             )
+    }
+
+    fn log_event(&self, label: &str, event: &NSEvent) {
+        let count = STATUS_VIEW_EVENT_LOGS.fetch_add(1, Ordering::Relaxed);
+        if count >= MAX_STATUS_VIEW_EVENT_LOGS {
+            return;
+        }
+
+        log::warn!(
+            "tray context menu: custom status view {label} event_type={:?} button={} touches={} pressed_buttons={}",
+            event.r#type(),
+            event.buttonNumber(),
+            active_touch_count_for_event(event, self.as_view()),
+            NSEvent::pressedMouseButtons()
+        );
     }
 }
 
