@@ -356,7 +356,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         set_context_menu_on_view_tree(status_view, ns_menu);
         accept_indirect_touch_events(status_view);
         update_native_tray_rect_from_view(status_view);
-        install_status_item_system_menu(&app_handle, ns_menu, &status_item, status_view);
+        status_item.setMenu(None);
         install_status_button_action_target(
             &app_handle,
             ns_menu,
@@ -370,7 +370,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         crate::macos_status_item_event_monitor::install(ns_menu, status_view);
         crate::macos_hid_secondary_click::install(ns_menu, status_view);
         crate::macos_trackpad::install_context_click_fallback(ns_menu, status_view);
-        log::debug!("tray context menu: using native status button system menu");
+        log::debug!("tray context menu: using native status button action menu");
 
         // Keep the muda menu alive for manually popped AppKit menu actions.
         std::mem::forget(menu);
@@ -499,11 +499,13 @@ objc2::define_class!(
             };
 
             log::debug!(
-                "tray context menu: status button action event_type={:?} event_number={} button={} touches={}",
+                "tray context menu: status button action event_type={:?} subtype={:?} event_number={} button={} touches={} pressed_buttons={}",
                 event.r#type(),
+                event.subtype(),
                 event.eventNumber(),
                 event.buttonNumber(),
-                active_touch_count_for_event(&event, &self.ivars().status_view)
+                active_touch_count_for_event(&event, &self.ivars().status_view),
+                objc2_app_kit::NSEvent::pressedMouseButtons()
             );
 
             let ivars = self.ivars();
@@ -738,6 +740,12 @@ fn status_button_action_event_mask() -> objc2_app_kit::NSEventMask {
         | NSEventMask::OtherMouseUp
         | NSEventMask::LeftMouseDown
         | NSEventMask::LeftMouseUp
+        | NSEventMask::SystemDefined
+        | NSEventMask::Gesture
+        | NSEventMask::BeginGesture
+        | NSEventMask::EndGesture
+        | NSEventMask::Pressure
+        | NSEventMask::DirectTouch
 }
 
 #[cfg(target_os = "macos")]
@@ -746,6 +754,7 @@ fn should_open_tray_menu_from_status_button_action_event(event: &objc2_app_kit::
         event.r#type(),
         event.modifierFlags(),
         event.buttonNumber(),
+        objc2_app_kit::NSEvent::pressedMouseButtons() as usize,
     )
 }
 
@@ -754,6 +763,7 @@ fn should_open_tray_menu_from_status_button_action_event_details(
     event_type: objc2_app_kit::NSEventType,
     modifier_flags: objc2_app_kit::NSEventModifierFlags,
     button_number: isize,
+    pressed_mouse_buttons: usize,
 ) -> bool {
     use objc2_app_kit::{NSEventModifierFlags, NSEventType};
 
@@ -761,6 +771,7 @@ fn should_open_tray_menu_from_status_button_action_event_details(
         || event_type == NSEventType::RightMouseUp
         || event_type == NSEventType::OtherMouseDown
         || event_type == NSEventType::OtherMouseUp
+        || should_open_tray_menu_from_trackpad_event_type(event_type, pressed_mouse_buttons)
         || ((event_type == NSEventType::LeftMouseDown || event_type == NSEventType::LeftMouseUp)
             && (modifier_flags.contains(NSEventModifierFlags::Control) || button_number == 1))
 }
@@ -2346,6 +2357,12 @@ mod tests {
         assert!(mask.contains(NSEventMask::OtherMouseUp));
         assert!(mask.contains(NSEventMask::LeftMouseDown));
         assert!(mask.contains(NSEventMask::LeftMouseUp));
+        assert!(mask.contains(NSEventMask::SystemDefined));
+        assert!(mask.contains(NSEventMask::Gesture));
+        assert!(mask.contains(NSEventMask::BeginGesture));
+        assert!(mask.contains(NSEventMask::EndGesture));
+        assert!(mask.contains(NSEventMask::Pressure));
+        assert!(mask.contains(NSEventMask::DirectTouch));
     }
 
     #[cfg(target_os = "macos")]
@@ -2406,13 +2423,15 @@ mod tests {
             should_open_tray_menu_from_status_button_action_event_details(
                 NSEventType::LeftMouseDown,
                 NSEventModifierFlags::empty(),
-                1
+                1,
+                0
             )
         );
         assert!(
             should_open_tray_menu_from_status_button_action_event_details(
                 NSEventType::LeftMouseDown,
                 NSEventModifierFlags::Control,
+                0,
                 0
             )
         );
@@ -2420,6 +2439,38 @@ mod tests {
             !should_open_tray_menu_from_status_button_action_event_details(
                 NSEventType::LeftMouseDown,
                 NSEventModifierFlags::empty(),
+                0,
+                0
+            )
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn status_button_action_opens_for_secondary_trackpad_events() {
+        use objc2_app_kit::{NSEventModifierFlags, NSEventType};
+
+        assert!(
+            should_open_tray_menu_from_status_button_action_event_details(
+                NSEventType::DirectTouch,
+                NSEventModifierFlags::empty(),
+                0,
+                1 << 1
+            )
+        );
+        assert!(
+            should_open_tray_menu_from_status_button_action_event_details(
+                NSEventType::SystemDefined,
+                NSEventModifierFlags::empty(),
+                0,
+                1 << 1
+            )
+        );
+        assert!(
+            !should_open_tray_menu_from_status_button_action_event_details(
+                NSEventType::DirectTouch,
+                NSEventModifierFlags::empty(),
+                0,
                 0
             )
         );
