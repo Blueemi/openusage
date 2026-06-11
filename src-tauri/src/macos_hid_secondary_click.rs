@@ -1,9 +1,13 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use objc2::Message;
 use objc2_app_kit::{NSMenu, NSView};
+
+#[path = "macos_hid_secondary_click_logic.rs"]
+mod logic;
+use logic::*;
 
 type CFAllocatorRef = *const libc::c_void;
 type CFArrayRef = *const libc::c_void;
@@ -19,10 +23,8 @@ type IOOptionBits = u32;
 
 const DEVICE_USAGE_KEY: &[u8] = b"DeviceUsage\0";
 const DEVICE_USAGE_PAGE_KEY: &[u8] = b"DeviceUsagePage\0";
-const HID_USAGE_PAGE_BUTTON: u32 = 0x09;
 const HID_USAGE_PAGE_DESKTOP: i32 = 0x01;
 const HID_USAGE_PAGE_DIGITIZER: i32 = 0x0d;
-const HID_USAGE_BUTTON_SECONDARY: u32 = 0x02;
 const HID_USAGE_MOUSE: i32 = 0x02;
 const HID_USAGE_POINTER: i32 = 0x01;
 const HID_USAGE_TOUCHPAD: i32 = 0x05;
@@ -93,27 +95,11 @@ type IOHIDValueCallback = unsafe extern "C" fn(
 );
 
 #[derive(Debug)]
-struct HidSecondaryClickState {
-    secondary_button_is_down: AtomicBool,
-    value_frames: AtomicU64,
-    runtime_started: AtomicBool,
-}
-
-impl HidSecondaryClickState {
-    fn new() -> Self {
-        Self {
-            secondary_button_is_down: AtomicBool::new(false),
-            value_frames: AtomicU64::new(0),
-            runtime_started: AtomicBool::new(false),
-        }
-    }
-}
-
-#[derive(Debug)]
 struct HidSecondaryClickTimerState {
     menu: objc2::rc::Retained<NSMenu>,
     status_view: objc2::rc::Retained<NSView>,
     click_state: Arc<HidSecondaryClickState>,
+    primary_button_was_down: std::cell::Cell<bool>,
     secondary_button_was_down: std::cell::Cell<bool>,
 }
 
@@ -167,24 +153,48 @@ fn install_hid_secondary_click_timer(
         menu: menu.retain(),
         status_view: status_view.retain(),
         click_state,
+        primary_button_was_down: std::cell::Cell::new(false),
         secondary_button_was_down: std::cell::Cell::new(false),
     });
     let block_state = state.clone();
     let block = block2::RcBlock::new(move |_timer: NonNull<NSTimer>| {
+        let now_millis = hid_elapsed_millis();
+        let primary_button_is_down = block_state
+            .click_state
+            .primary_button_is_down
+            .load(Ordering::SeqCst);
         let secondary_button_is_down = block_state
             .click_state
             .secondary_button_is_down
             .load(Ordering::SeqCst);
+        let primary_button_was_down = block_state
+            .primary_button_was_down
+            .replace(primary_button_is_down);
         let secondary_button_was_down = block_state
             .secondary_button_was_down
             .replace(secondary_button_is_down);
+        let two_contact_signal_is_active = hid_two_contact_signal_is_active(
+            &block_state.click_state,
+            now_millis,
+            HID_RECENT_TWO_CONTACT_MILLIS,
+        );
+        let cursor_inside_status_view =
+            crate::tray::is_mouse_inside_status_view(&block_state.status_view);
 
         if should_open_menu_from_hid_button_state(
             secondary_button_was_down,
             secondary_button_is_down,
-            crate::tray::is_mouse_inside_status_view(&block_state.status_view),
+            cursor_inside_status_view,
         ) {
             log::debug!("tray context menu: IOHID secondary button down");
+            crate::tray::show_native_tray_menu_at_view(&block_state.menu, &block_state.status_view);
+        } else if should_open_menu_from_hid_primary_two_contact_state(
+            primary_button_was_down,
+            primary_button_is_down,
+            two_contact_signal_is_active,
+            cursor_inside_status_view,
+        ) {
+            log::warn!("tray context menu: IOHID primary button with two contacts");
             crate::tray::show_native_tray_menu_at_view(&block_state.menu, &block_state.status_view);
         }
     });
@@ -332,31 +342,25 @@ unsafe extern "C" fn hid_secondary_click_value_callback(
 
     let usage_page = unsafe { IOHIDElementGetUsagePage(element) };
     let usage = unsafe { IOHIDElementGetUsage(element) };
-    if !is_secondary_button_hid_usage(usage_page, usage) {
-        return;
-    }
-
     let state = unsafe { &*(context.cast::<HidSecondaryClickState>()) };
-    let is_down = unsafe { IOHIDValueGetIntegerValue(value) } != 0;
-    let previous = state
-        .secondary_button_is_down
-        .swap(is_down, Ordering::SeqCst);
-    let frames = state.value_frames.fetch_add(1, Ordering::SeqCst) + 1;
-    if frames == 1 || previous != is_down {
-        log::debug!("tray context menu: IOHID secondary button is_down={is_down}");
+    let integer_value = unsafe { IOHIDValueGetIntegerValue(value) };
+    if is_button_hid_usage(usage_page, usage, HID_USAGE_BUTTON_PRIMARY) {
+        update_hid_button_state(
+            state,
+            &state.primary_button_is_down,
+            integer_value,
+            "primary",
+        );
+    } else if is_secondary_button_hid_usage(usage_page, usage) {
+        update_hid_button_state(
+            state,
+            &state.secondary_button_is_down,
+            integer_value,
+            "secondary",
+        );
+    } else if is_contact_count_hid_usage(usage_page, usage) {
+        update_hid_contact_count(state, integer_value);
     }
-}
-
-fn is_secondary_button_hid_usage(usage_page: u32, usage: u32) -> bool {
-    usage_page == HID_USAGE_PAGE_BUTTON && usage == HID_USAGE_BUTTON_SECONDARY
-}
-
-fn should_open_menu_from_hid_button_state(
-    secondary_button_was_down: bool,
-    secondary_button_is_down: bool,
-    cursor_inside_status_view: bool,
-) -> bool {
-    !secondary_button_was_down && secondary_button_is_down && cursor_inside_status_view
 }
 
 fn iohid_status_is_success(status: IOReturn) -> bool {
@@ -364,27 +368,5 @@ fn iohid_status_is_success(status: IOReturn) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn secondary_button_usage_matches_hid_button_two() {
-        assert!(is_secondary_button_hid_usage(0x09, 0x02));
-        assert!(!is_secondary_button_hid_usage(0x09, 0x01));
-        assert!(!is_secondary_button_hid_usage(0x01, 0x02));
-    }
-
-    #[test]
-    fn hid_button_down_edge_opens_only_inside_status_view() {
-        assert!(should_open_menu_from_hid_button_state(false, true, true));
-        assert!(!should_open_menu_from_hid_button_state(true, true, true));
-        assert!(!should_open_menu_from_hid_button_state(false, false, true));
-        assert!(!should_open_menu_from_hid_button_state(false, true, false));
-    }
-
-    #[test]
-    fn iohid_zero_status_is_success() {
-        assert!(iohid_status_is_success(0));
-        assert!(!iohid_status_is_success(1));
-    }
-}
+#[path = "macos_hid_secondary_click_tests.rs"]
+mod tests;
