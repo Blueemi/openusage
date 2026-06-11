@@ -107,6 +107,10 @@ fn should_open_from_monitor_event_details(
 }
 
 fn touch_count_for_event(event: &NSEvent, status_view: &NSView) -> usize {
+    if !event_type_can_report_touches(event.r#type()) {
+        return 0;
+    }
+
     let touches_in_view = event
         .touchesMatchingPhase_inView(objc2_app_kit::NSTouchPhase::Touching, Some(status_view))
         .count();
@@ -124,6 +128,21 @@ fn touch_count_for_event(event: &NSEvent, status_view: &NSView) -> usize {
         .max(touches_in_event)
         .max(any_touches_in_view)
         .max(any_touches_in_event)
+}
+
+fn event_type_can_report_touches(event_type: objc2_app_kit::NSEventType) -> bool {
+    use objc2_app_kit::NSEventType;
+
+    event_type == NSEventType::Gesture
+        || event_type == NSEventType::Magnify
+        || event_type == NSEventType::Swipe
+        || event_type == NSEventType::Rotate
+        || event_type == NSEventType::BeginGesture
+        || event_type == NSEventType::EndGesture
+        || event_type == NSEventType::SmartMagnify
+        || event_type == NSEventType::Pressure
+        || event_type == NSEventType::DirectTouch
+        || event_type == NSEventType::ScrollWheel
 }
 
 fn log_monitor_candidate(
@@ -223,5 +242,15 @@ mod tests {
         assert!(!should_open_from_monitor_event_details(false, 2, false));
         assert!(!should_open_from_monitor_event_details(false, 1, true));
         assert!(should_open_from_monitor_event_details(true, 0, true));
+    }
+
+    #[test]
+    fn touch_count_queries_only_run_for_touch_capable_events() {
+        use objc2_app_kit::NSEventType;
+
+        assert!(!event_type_can_report_touches(NSEventType::LeftMouseDown));
+        assert!(!event_type_can_report_touches(NSEventType::RightMouseDown));
+        assert!(event_type_can_report_touches(NSEventType::Gesture));
+        assert!(event_type_can_report_touches(NSEventType::DirectTouch));
     }
 }

@@ -356,7 +356,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         set_context_menu_on_view_tree(status_view, ns_menu);
         accept_indirect_touch_events(status_view);
         update_native_tray_rect_from_view(status_view);
-        status_item.setMenu(None);
+        install_status_item_system_menu(&app_handle, ns_menu, &status_item, status_view);
         install_status_button_action_target(
             &app_handle,
             ns_menu,
@@ -370,7 +370,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         crate::macos_status_item_event_monitor::install(ns_menu, status_view);
         crate::macos_hid_secondary_click::install(ns_menu, status_view);
         crate::macos_trackpad::install_context_click_fallback(ns_menu, status_view);
-        log::debug!("tray context menu: using native status button action menu");
+        log::debug!("tray context menu: using native status button system menu");
 
         // Keep the muda menu alive for manually popped AppKit menu actions.
         std::mem::forget(menu);
@@ -412,13 +412,22 @@ objc2::define_class!(
                 return;
             };
 
+            let touch_count = active_touch_count_for_event(&event, &self.ivars().status_view);
+            let pressed_mouse_buttons = objc2_app_kit::NSEvent::pressedMouseButtons() as usize;
             log::debug!(
-                "tray context menu: system status menu opening event_type={:?} button={}",
+                "tray context menu: system status menu opening event_type={:?} subtype={:?} button={} touches={} pressed_buttons={}",
                 event.r#type(),
-                event.buttonNumber()
+                event.subtype(),
+                event.buttonNumber(),
+                touch_count,
+                pressed_mouse_buttons
             );
             mark_native_menu_opened(std::time::Instant::now());
-            if !should_cancel_status_item_system_menu_for_primary_click(&event) {
+            if !should_cancel_status_item_system_menu_for_primary_click(
+                &event,
+                touch_count,
+                pressed_mouse_buttons,
+            ) {
                 update_native_tray_rect_from_view(&self.ivars().status_view);
                 return;
             }
@@ -799,11 +808,17 @@ fn should_handle_primary_status_item_click_details(
 }
 
 #[cfg(target_os = "macos")]
-fn should_cancel_status_item_system_menu_for_primary_click(event: &objc2_app_kit::NSEvent) -> bool {
+fn should_cancel_status_item_system_menu_for_primary_click(
+    event: &objc2_app_kit::NSEvent,
+    touch_count: usize,
+    pressed_mouse_buttons: usize,
+) -> bool {
     should_cancel_status_item_system_menu_for_primary_click_details(
         event.r#type(),
         event.modifierFlags(),
         event.buttonNumber(),
+        touch_count,
+        pressed_mouse_buttons,
     )
 }
 
@@ -812,12 +827,13 @@ fn should_cancel_status_item_system_menu_for_primary_click_details(
     event_type: objc2_app_kit::NSEventType,
     modifier_flags: objc2_app_kit::NSEventModifierFlags,
     button_number: isize,
+    touch_count: usize,
+    pressed_mouse_buttons: usize,
 ) -> bool {
-    use objc2_app_kit::{NSEventModifierFlags, NSEventType};
-
-    (event_type == NSEventType::LeftMouseDown || event_type == NSEventType::LeftMouseUp)
-        && button_number == 0
-        && !modifier_flags.contains(NSEventModifierFlags::Control)
+    should_handle_primary_status_item_click_details(event_type, modifier_flags, button_number)
+        && touch_count < 2
+        && !is_appkit_secondary_mouse_button_pressed(pressed_mouse_buttons)
+        && !should_open_tray_menu_from_trackpad_event_type(event_type, pressed_mouse_buttons)
 }
 
 #[cfg(target_os = "macos")]
@@ -1450,6 +1466,10 @@ fn active_touch_count_for_event(
     event: &objc2_app_kit::NSEvent,
     view: &objc2_app_kit::NSView,
 ) -> usize {
+    if !event_type_can_report_touches(event.r#type()) {
+        return 0;
+    }
+
     let touches_in_view = event
         .touchesMatchingPhase_inView(objc2_app_kit::NSTouchPhase::Touching, Some(view))
         .count();
@@ -1467,6 +1487,22 @@ fn active_touch_count_for_event(
         .max(touches_in_event)
         .max(any_touches_in_view)
         .max(any_touches_in_event)
+}
+
+#[cfg(target_os = "macos")]
+fn event_type_can_report_touches(event_type: objc2_app_kit::NSEventType) -> bool {
+    use objc2_app_kit::NSEventType;
+
+    event_type == NSEventType::Gesture
+        || event_type == NSEventType::Magnify
+        || event_type == NSEventType::Swipe
+        || event_type == NSEventType::Rotate
+        || event_type == NSEventType::BeginGesture
+        || event_type == NSEventType::EndGesture
+        || event_type == NSEventType::SmartMagnify
+        || event_type == NSEventType::Pressure
+        || event_type == NSEventType::DirectTouch
+        || event_type == NSEventType::ScrollWheel
 }
 
 #[cfg(target_os = "macos")]
@@ -2512,6 +2548,8 @@ mod tests {
             should_cancel_status_item_system_menu_for_primary_click_details(
                 NSEventType::LeftMouseDown,
                 NSEventModifierFlags::empty(),
+                0,
+                0,
                 0
             )
         );
@@ -2519,6 +2557,8 @@ mod tests {
             should_cancel_status_item_system_menu_for_primary_click_details(
                 NSEventType::LeftMouseUp,
                 NSEventModifierFlags::empty(),
+                0,
+                0,
                 0
             )
         );
@@ -2526,23 +2566,58 @@ mod tests {
             !should_cancel_status_item_system_menu_for_primary_click_details(
                 NSEventType::LeftMouseDown,
                 NSEventModifierFlags::Control,
+                0,
+                0,
                 0
+            )
+        );
+        assert!(
+            !should_cancel_status_item_system_menu_for_primary_click_details(
+                NSEventType::LeftMouseDown,
+                NSEventModifierFlags::empty(),
+                0,
+                2,
+                0
+            )
+        );
+        assert!(
+            !should_cancel_status_item_system_menu_for_primary_click_details(
+                NSEventType::LeftMouseDown,
+                NSEventModifierFlags::empty(),
+                0,
+                0,
+                1 << 1
             )
         );
         assert!(
             !should_cancel_status_item_system_menu_for_primary_click_details(
                 NSEventType::RightMouseDown,
                 NSEventModifierFlags::empty(),
-                1
+                1,
+                0,
+                0
             )
         );
         assert!(
             !should_cancel_status_item_system_menu_for_primary_click_details(
                 NSEventType::OtherMouseDown,
                 NSEventModifierFlags::empty(),
-                2
+                2,
+                0,
+                0
             )
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn touch_count_queries_only_run_for_touch_capable_events() {
+        use objc2_app_kit::NSEventType;
+
+        assert!(!event_type_can_report_touches(NSEventType::LeftMouseDown));
+        assert!(!event_type_can_report_touches(NSEventType::RightMouseDown));
+        assert!(event_type_can_report_touches(NSEventType::Gesture));
+        assert!(event_type_can_report_touches(NSEventType::DirectTouch));
     }
 
     #[cfg(target_os = "macos")]

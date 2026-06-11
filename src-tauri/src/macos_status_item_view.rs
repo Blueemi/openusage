@@ -288,6 +288,10 @@ fn accept_indirect_touch_events(view: &NSView) {
 }
 
 fn active_touch_count_for_event(event: &NSEvent, view: &NSView) -> usize {
+    if !event_type_can_report_touches(event.r#type()) {
+        return 0;
+    }
+
     let touches_in_view = event
         .touchesMatchingPhase_inView(objc2_app_kit::NSTouchPhase::Touching, Some(view))
         .count();
@@ -305,6 +309,19 @@ fn active_touch_count_for_event(event: &NSEvent, view: &NSView) -> usize {
         .max(touches_in_event)
         .max(any_touches_in_view)
         .max(any_touches_in_event)
+}
+
+fn event_type_can_report_touches(event_type: NSEventType) -> bool {
+    event_type == NSEventType::Gesture
+        || event_type == NSEventType::Magnify
+        || event_type == NSEventType::Swipe
+        || event_type == NSEventType::Rotate
+        || event_type == NSEventType::BeginGesture
+        || event_type == NSEventType::EndGesture
+        || event_type == NSEventType::SmartMagnify
+        || event_type == NSEventType::Pressure
+        || event_type == NSEventType::DirectTouch
+        || event_type == NSEventType::ScrollWheel
 }
 
 fn event_is_context_click(event: &NSEvent) -> bool {
@@ -383,6 +400,14 @@ mod tests {
         assert!(!should_open_from_touch_count(false, 1));
         assert!(should_reset_touch_gate(1));
         assert!(!should_reset_touch_gate(2));
+    }
+
+    #[test]
+    fn touch_count_queries_only_run_for_touch_capable_events() {
+        assert!(!event_type_can_report_touches(NSEventType::LeftMouseDown));
+        assert!(!event_type_can_report_touches(NSEventType::RightMouseDown));
+        assert!(event_type_can_report_touches(NSEventType::Gesture));
+        assert!(event_type_can_report_touches(NSEventType::DirectTouch));
     }
 
     #[test]
