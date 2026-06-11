@@ -294,8 +294,17 @@ fn active_touch_count_for_event(event: &NSEvent, view: &NSView) -> usize {
     let touches_in_event = event
         .touchesMatchingPhase_inView(objc2_app_kit::NSTouchPhase::Touching, None)
         .count();
+    let any_touches_in_view = event
+        .touchesMatchingPhase_inView(objc2_app_kit::NSTouchPhase::Any, Some(view))
+        .count();
+    let any_touches_in_event = event
+        .touchesMatchingPhase_inView(objc2_app_kit::NSTouchPhase::Any, None)
+        .count();
 
-    touches_in_view.max(touches_in_event)
+    touches_in_view
+        .max(touches_in_event)
+        .max(any_touches_in_view)
+        .max(any_touches_in_event)
 }
 
 fn event_is_context_click(event: &NSEvent) -> bool {

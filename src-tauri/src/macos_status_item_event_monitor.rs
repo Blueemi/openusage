@@ -87,8 +87,72 @@ fn install_global_monitor(menu: &NSMenu, status_view: &NSView) {
 }
 
 fn should_open_from_monitor_event(event: &NSEvent, status_view: &NSView) -> bool {
-    crate::tray::should_open_tray_menu_from_native_event(event)
-        && crate::tray::is_mouse_inside_status_view(status_view)
+    let mouse_inside = crate::tray::is_mouse_inside_status_view(status_view);
+    let native_open = crate::tray::should_open_tray_menu_from_native_event(event);
+    let touch_count = touch_count_for_event(event, status_view);
+    let should_open =
+        should_open_from_monitor_event_details(native_open, touch_count, mouse_inside);
+
+    log_monitor_candidate(event, touch_count, mouse_inside, native_open, should_open);
+
+    should_open
+}
+
+fn should_open_from_monitor_event_details(
+    native_open: bool,
+    touch_count: usize,
+    mouse_inside: bool,
+) -> bool {
+    mouse_inside && (native_open || touch_count >= 2)
+}
+
+fn touch_count_for_event(event: &NSEvent, status_view: &NSView) -> usize {
+    let touches_in_view = event
+        .touchesMatchingPhase_inView(objc2_app_kit::NSTouchPhase::Touching, Some(status_view))
+        .count();
+    let touches_in_event = event
+        .touchesMatchingPhase_inView(objc2_app_kit::NSTouchPhase::Touching, None)
+        .count();
+    let any_touches_in_view = event
+        .touchesMatchingPhase_inView(objc2_app_kit::NSTouchPhase::Any, Some(status_view))
+        .count();
+    let any_touches_in_event = event
+        .touchesMatchingPhase_inView(objc2_app_kit::NSTouchPhase::Any, None)
+        .count();
+
+    touches_in_view
+        .max(touches_in_event)
+        .max(any_touches_in_view)
+        .max(any_touches_in_event)
+}
+
+fn log_monitor_candidate(
+    event: &NSEvent,
+    touch_count: usize,
+    mouse_inside: bool,
+    native_open: bool,
+    should_open: bool,
+) {
+    if !mouse_inside && touch_count < 2 {
+        return;
+    }
+
+    let count = EVENT_MONITOR_LOGS.fetch_add(1, Ordering::Relaxed);
+    if count >= MAX_EVENT_MONITOR_LOGS {
+        return;
+    }
+
+    log::warn!(
+        "tray context menu: AppKit monitor candidate event_type={:?} subtype={:?} button={} pressed_buttons={} touches={} inside={} native_open={} should_open={}",
+        event.r#type(),
+        event.subtype(),
+        event.buttonNumber(),
+        NSEvent::pressedMouseButtons(),
+        touch_count,
+        mouse_inside,
+        native_open,
+        should_open
+    );
 }
 
 fn log_monitor_event(kind: &str, event: &NSEvent) {
@@ -98,8 +162,9 @@ fn log_monitor_event(kind: &str, event: &NSEvent) {
     }
 
     log::warn!(
-        "tray context menu: AppKit {kind} monitor open event_type={:?} button={} pressed_buttons={}",
+        "tray context menu: AppKit {kind} monitor open event_type={:?} subtype={:?} button={} pressed_buttons={}",
         event.r#type(),
+        event.subtype(),
         event.buttonNumber(),
         NSEvent::pressedMouseButtons()
     );
@@ -150,5 +215,13 @@ mod tests {
         assert!(mask.contains(NSEventMask::EndGesture));
         assert!(mask.contains(NSEventMask::Pressure));
         assert!(mask.contains(NSEventMask::DirectTouch));
+    }
+
+    #[test]
+    fn appkit_monitor_opens_for_two_touch_inside_event() {
+        assert!(should_open_from_monitor_event_details(false, 2, true));
+        assert!(!should_open_from_monitor_event_details(false, 2, false));
+        assert!(!should_open_from_monitor_event_details(false, 1, true));
+        assert!(should_open_from_monitor_event_details(true, 0, true));
     }
 }
