@@ -216,18 +216,6 @@ impl HidSecondaryClickRuntime {
 
         unsafe {
             set_pointer_device_matching(manager);
-            let open_status = IOHIDManagerOpen(manager, 0);
-            if !iohid_status_is_success(open_status) {
-                IOHIDManagerSetDeviceMatching(manager, std::ptr::null());
-                let broad_open_status = IOHIDManagerOpen(manager, 0);
-                if !iohid_status_is_success(broad_open_status) {
-                    return Err(format!(
-                        "IOHIDManagerOpen failed status={open_status}, broad_status={broad_open_status}"
-                    ));
-                }
-                log::warn!("tray context menu: IOHID opened with broad device matching");
-            }
-
             IOHIDManagerRegisterInputValueCallback(
                 manager,
                 Some(hid_secondary_click_value_callback),
@@ -241,6 +229,18 @@ impl HidSecondaryClickRuntime {
         }
 
         unsafe { IOHIDManagerScheduleWithRunLoop(manager, run_loop, kCFRunLoopCommonModes) };
+
+        let open_status = unsafe { IOHIDManagerOpen(manager, 0) };
+        if !iohid_status_is_success(open_status) {
+            unsafe { IOHIDManagerSetDeviceMatching(manager, std::ptr::null()) };
+            let broad_open_status = unsafe { IOHIDManagerOpen(manager, 0) };
+            if !iohid_status_is_success(broad_open_status) {
+                return Err(format!(
+                    "IOHIDManagerOpen failed status={open_status}, broad_status={broad_open_status}"
+                ));
+            }
+            log::warn!("tray context menu: IOHID opened with broad device matching");
+        }
 
         Ok(Self {
             _manager: manager,

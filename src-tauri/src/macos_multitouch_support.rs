@@ -3,9 +3,6 @@ use std::ffi::CString;
 pub(crate) type MTDeviceRef = *mut libc::c_void;
 type CFArrayRef = *const libc::c_void;
 type CFIndex = isize;
-type CFRunLoopRef = *const libc::c_void;
-type CFRunLoopSourceRef = *const libc::c_void;
-type CFStringRef = *const libc::c_void;
 pub(crate) type MTContactCallback = unsafe extern "C" fn(
     MTDeviceRef,
     *mut libc::c_void,
@@ -15,11 +12,7 @@ pub(crate) type MTContactCallback = unsafe extern "C" fn(
 );
 type MTDeviceCreateDefault = unsafe extern "C" fn() -> MTDeviceRef;
 type MTDeviceCreateList = unsafe extern "C" fn() -> CFArrayRef;
-type MTDeviceCreateMultitouchRunLoopSource =
-    unsafe extern "C" fn(MTDeviceRef) -> CFRunLoopSourceRef;
 type MTRegisterContactFrameCallback = unsafe extern "C" fn(MTDeviceRef, MTContactCallback);
-type MTDeviceScheduleOnRunLoop =
-    unsafe extern "C" fn(MTDeviceRef, CFRunLoopRef, CFStringRef) -> libc::c_int;
 type MTDeviceStart = unsafe extern "C" fn(MTDeviceRef, libc::c_int) -> libc::c_int;
 
 const MULTITOUCH_FRAMEWORK_PATH: &str =
@@ -27,19 +20,14 @@ const MULTITOUCH_FRAMEWORK_PATH: &str =
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
-    static kCFRunLoopCommonModes: CFStringRef;
-
     fn CFArrayGetCount(array: CFArrayRef) -> CFIndex;
     fn CFArrayGetValueAtIndex(array: CFArrayRef, index: CFIndex) -> *const libc::c_void;
-    fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
-    fn CFRunLoopGetMain() -> CFRunLoopRef;
 }
 
 pub(crate) struct MultitouchSupportRuntime {
     _handle: *mut libc::c_void,
     _device_list: Option<CFArrayRef>,
     _devices: Vec<MTDeviceRef>,
-    _run_loop_sources: Vec<CFRunLoopSourceRef>,
 }
 
 impl MultitouchSupportRuntime {
@@ -56,27 +44,15 @@ impl MultitouchSupportRuntime {
             unsafe { load_optional_symbol(handle, b"MTDeviceCreateDefault\0") };
         let register_callback: MTRegisterContactFrameCallback =
             unsafe { load_symbol(handle, b"MTRegisterContactFrameCallback\0")? };
-        let schedule_on_run_loop: Option<MTDeviceScheduleOnRunLoop> =
-            unsafe { load_optional_symbol(handle, b"MTDeviceScheduleOnRunLoop\0") };
-        let create_run_loop_source: Option<MTDeviceCreateMultitouchRunLoopSource> =
-            unsafe { load_optional_symbol(handle, b"MTDeviceCreateMultitouchRunLoopSource\0") };
         let device_start: MTDeviceStart = unsafe { load_symbol(handle, b"MTDeviceStart\0")? };
 
         let (devices, device_list) =
             unsafe { create_multitouch_devices(create_list, create_default)? };
         let mut started_device_count = 0usize;
-        let mut run_loop_sources = Vec::new();
 
         for &device in &devices {
             unsafe {
                 register_callback(device, callback);
-                if let Some(source) = schedule_device_on_main_run_loop(
-                    schedule_on_run_loop,
-                    create_run_loop_source,
-                    device,
-                ) {
-                    run_loop_sources.push(source);
-                }
                 let start_status = device_start(device, 0);
                 if mt_status_is_success(start_status) {
                     started_device_count += 1;
@@ -96,7 +72,6 @@ impl MultitouchSupportRuntime {
             _handle: handle,
             _device_list: device_list,
             _devices: devices,
-            _run_loop_sources: run_loop_sources,
         })
     }
 
@@ -142,67 +117,6 @@ fn push_unique_device(devices: &mut Vec<MTDeviceRef>, device: MTDeviceRef) {
     }
 
     devices.push(device);
-}
-
-unsafe fn schedule_device_on_main_run_loop(
-    schedule_on_run_loop: Option<MTDeviceScheduleOnRunLoop>,
-    create_run_loop_source: Option<MTDeviceCreateMultitouchRunLoopSource>,
-    device: MTDeviceRef,
-) -> Option<CFRunLoopSourceRef> {
-    unsafe {
-        schedule_device_on_main_run_loop_or_create_source(
-            schedule_on_run_loop,
-            create_run_loop_source,
-            device,
-        )
-    }
-}
-
-unsafe fn schedule_device_on_main_run_loop_or_create_source(
-    schedule_on_run_loop: Option<MTDeviceScheduleOnRunLoop>,
-    create_run_loop_source: Option<MTDeviceCreateMultitouchRunLoopSource>,
-    device: MTDeviceRef,
-) -> Option<CFRunLoopSourceRef> {
-    let run_loop = unsafe { CFRunLoopGetMain() };
-    if run_loop.is_null() {
-        log::warn!("tray context menu: raw trackpad main run loop unavailable");
-        return None;
-    }
-
-    let Some(schedule_on_run_loop) = schedule_on_run_loop else {
-        log::debug!("tray context menu: raw trackpad run-loop schedule symbol unavailable");
-        return unsafe { create_and_add_run_loop_source(create_run_loop_source, device, run_loop) };
-    };
-
-    let status = unsafe { schedule_on_run_loop(device, run_loop, kCFRunLoopCommonModes) };
-    if mt_status_is_success(status) {
-        log::debug!("tray context menu: scheduled raw trackpad device on main run loop");
-        None
-    } else {
-        log::warn!("tray context menu: raw trackpad run-loop schedule failed status={status}");
-        unsafe { create_and_add_run_loop_source(create_run_loop_source, device, run_loop) }
-    }
-}
-
-unsafe fn create_and_add_run_loop_source(
-    create_run_loop_source: Option<MTDeviceCreateMultitouchRunLoopSource>,
-    device: MTDeviceRef,
-    run_loop: CFRunLoopRef,
-) -> Option<CFRunLoopSourceRef> {
-    let Some(create_run_loop_source) = create_run_loop_source else {
-        log::debug!("tray context menu: raw trackpad run-loop source symbol unavailable");
-        return None;
-    };
-
-    let source = unsafe { create_run_loop_source(device) };
-    if source.is_null() {
-        log::warn!("tray context menu: raw trackpad run-loop source unavailable");
-        return None;
-    }
-
-    unsafe { CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes) };
-    log::warn!("tray context menu: added raw trackpad run-loop source");
-    Some(source)
 }
 
 fn mt_status_is_success(status: libc::c_int) -> bool {
