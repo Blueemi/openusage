@@ -1180,8 +1180,8 @@ fn install_tray_input_overlay_window(
         log::warn!("tray context menu: status item frame unavailable for overlay window");
         return;
     };
-    let overlay_frame =
-        tray_input_overlay_window_frame(screen_frame, screen_top_y_for_status_frame(screen_frame));
+    let screen_top_y = screen_top_y_for_status_frame(screen_frame);
+    let overlay_frame = tray_input_overlay_window_frame(screen_frame, screen_top_y);
 
     let overlay_view = unsafe {
         let view = mtm.alloc().set_ivars(TrayInputOverlayViewIvars {
@@ -1236,12 +1236,16 @@ fn install_tray_input_overlay_window(
     std::mem::forget(block);
     std::mem::forget(window);
     std::mem::forget(overlay_view);
-    log::warn!("tray context menu: installed status-bar input overlay window");
+    log::warn!(
+        "tray context menu: installed status-bar input overlay window level={}",
+        tray_input_overlay_window_level()
+    );
 }
 
 #[cfg(target_os = "macos")]
 fn should_install_tray_input_overlay_window(installed_custom_status_view: bool) -> bool {
-    !installed_custom_status_view
+    let _ = installed_custom_status_view;
+    true
 }
 
 #[cfg(target_os = "macos")]
@@ -1270,14 +1274,51 @@ fn screen_top_y_for_status_frame(status_frame: objc2_foundation::NSRect) -> f64 
         return status_frame.origin.y + status_frame.size.height;
     };
 
+    let screens = objc2_app_kit::NSScreen::screens(mtm);
+    for index in 0..screens.count() {
+        let screen = screens.objectAtIndex(index);
+        let frame = screen.frame();
+        if screen_frame_matches_status_frame(frame, status_frame) {
+            return frame.origin.y + frame.size.height;
+        }
+    }
+
     objc2_app_kit::NSScreen::mainScreen(mtm)
         .map(|screen| screen.frame().origin.y + screen.frame().size.height)
-        .filter(|screen_top_y| {
-            let status_top_y = status_frame.origin.y + status_frame.size.height;
-            (screen_top_y - status_top_y).abs()
-                <= crate::macos_status_item_icon::STATUS_ITEM_MENU_BAR_HIT_HEIGHT
-        })
         .unwrap_or(status_frame.origin.y + status_frame.size.height)
+}
+
+#[cfg(target_os = "macos")]
+fn screen_frame_matches_status_frame(
+    screen_frame: objc2_foundation::NSRect,
+    status_frame: objc2_foundation::NSRect,
+) -> bool {
+    point_is_inside_rect(rect_center(status_frame), screen_frame)
+        || rects_intersect(screen_frame, status_frame)
+}
+
+#[cfg(target_os = "macos")]
+fn rect_center(rect: objc2_foundation::NSRect) -> objc2_foundation::NSPoint {
+    objc2_foundation::NSPoint::new(
+        rect.origin.x + (rect.size.width / 2.0),
+        rect.origin.y + (rect.size.height / 2.0),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn point_is_inside_rect(point: objc2_foundation::NSPoint, rect: objc2_foundation::NSRect) -> bool {
+    point.x >= rect.origin.x
+        && point.x <= rect.origin.x + rect.size.width
+        && point.y >= rect.origin.y
+        && point.y <= rect.origin.y + rect.size.height
+}
+
+#[cfg(target_os = "macos")]
+fn rects_intersect(first: objc2_foundation::NSRect, second: objc2_foundation::NSRect) -> bool {
+    first.origin.x < second.origin.x + second.size.width
+        && first.origin.x + first.size.width > second.origin.x
+        && first.origin.y < second.origin.y + second.size.height
+        && first.origin.y + first.size.height > second.origin.y
 }
 
 #[cfg(target_os = "macos")]
@@ -1321,7 +1362,7 @@ fn tray_input_overlay_content_frame(
 
 #[cfg(target_os = "macos")]
 fn tray_input_overlay_window_level() -> objc2_app_kit::NSWindowLevel {
-    objc2_app_kit::NSStatusWindowLevel + 1
+    objc2_app_kit::NSPopUpMenuWindowLevel - 1
 }
 
 #[cfg(target_os = "macos")]
@@ -2570,13 +2611,36 @@ mod tests {
     fn tray_input_overlay_window_sits_above_status_item_level() {
         assert!(tray_input_overlay_window_level() > objc2_app_kit::NSStatusWindowLevel);
         assert!(tray_input_overlay_window_level() < objc2_app_kit::NSPopUpMenuWindowLevel);
+        assert_eq!(
+            tray_input_overlay_window_level(),
+            objc2_app_kit::NSPopUpMenuWindowLevel - 1
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn tray_input_overlay_window_is_skipped_for_custom_status_view() {
-        assert!(!should_install_tray_input_overlay_window(true));
+    fn tray_input_overlay_window_is_used_for_custom_status_view() {
+        assert!(should_install_tray_input_overlay_window(true));
         assert!(should_install_tray_input_overlay_window(false));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn status_frame_matches_screen_that_contains_status_center() {
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+        let primary_screen = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1440.0, 900.0));
+        let status_screen = NSRect::new(NSPoint::new(1440.0, 200.0), NSSize::new(1280.0, 800.0));
+        let status_frame = NSRect::new(NSPoint::new(1600.0, 972.0), NSSize::new(24.0, 22.0));
+
+        assert!(!screen_frame_matches_status_frame(
+            primary_screen,
+            status_frame
+        ));
+        assert!(screen_frame_matches_status_frame(
+            status_screen,
+            status_frame
+        ));
     }
 
     #[cfg(target_os = "macos")]
