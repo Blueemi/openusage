@@ -108,6 +108,12 @@ struct HidSecondaryClickRuntime {
     _state: Arc<HidSecondaryClickState>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HidDeviceMatching {
+    PointerDevices,
+    AllDevices,
+}
+
 static HID_SECONDARY_CLICK_STATE: OnceLock<Arc<HidSecondaryClickState>> = OnceLock::new();
 
 pub(crate) fn install(menu: &NSMenu, status_view: &NSView) {
@@ -209,13 +215,34 @@ fn install_hid_secondary_click_timer(
 
 impl HidSecondaryClickRuntime {
     unsafe fn start(state: Arc<HidSecondaryClickState>) -> Result<Self, String> {
+        match unsafe { Self::start_with_matching(state.clone(), HidDeviceMatching::PointerDevices) }
+        {
+            Ok(runtime) => Ok(runtime),
+            Err(pointer_error) => {
+                log::warn!(
+                    "tray context menu: IOHID pointer-device matching failed: {pointer_error}; retrying broad matching"
+                );
+                unsafe { Self::start_with_matching(state, HidDeviceMatching::AllDevices) }.map(
+                    |runtime| {
+                        log::warn!("tray context menu: IOHID opened with broad device matching");
+                        runtime
+                    },
+                )
+            }
+        }
+    }
+
+    unsafe fn start_with_matching(
+        state: Arc<HidSecondaryClickState>,
+        matching: HidDeviceMatching,
+    ) -> Result<Self, String> {
         let manager = unsafe { IOHIDManagerCreate(std::ptr::null(), 0) };
         if manager.is_null() {
             return Err("IOHIDManagerCreate returned null".to_string());
         }
 
         unsafe {
-            set_pointer_device_matching(manager);
+            set_hid_device_matching(manager, matching);
             IOHIDManagerRegisterInputValueCallback(
                 manager,
                 Some(hid_secondary_click_value_callback),
@@ -232,20 +259,32 @@ impl HidSecondaryClickRuntime {
 
         let open_status = unsafe { IOHIDManagerOpen(manager, 0) };
         if !iohid_status_is_success(open_status) {
-            unsafe { IOHIDManagerSetDeviceMatching(manager, std::ptr::null()) };
-            let broad_open_status = unsafe { IOHIDManagerOpen(manager, 0) };
-            if !iohid_status_is_success(broad_open_status) {
-                return Err(format!(
-                    "IOHIDManagerOpen failed status={open_status}, broad_status={broad_open_status}"
-                ));
-            }
-            log::warn!("tray context menu: IOHID opened with broad device matching");
+            return Err(format!(
+                "IOHIDManagerOpen({}) failed status={open_status}",
+                hid_device_matching_label(matching)
+            ));
         }
 
         Ok(Self {
             _manager: manager,
             _state: state,
         })
+    }
+}
+
+unsafe fn set_hid_device_matching(manager: IOHIDManagerRef, matching: HidDeviceMatching) {
+    match matching {
+        HidDeviceMatching::PointerDevices => unsafe { set_pointer_device_matching(manager) },
+        HidDeviceMatching::AllDevices => unsafe {
+            IOHIDManagerSetDeviceMatching(manager, std::ptr::null())
+        },
+    }
+}
+
+fn hid_device_matching_label(matching: HidDeviceMatching) -> &'static str {
+    match matching {
+        HidDeviceMatching::PointerDevices => "pointer",
+        HidDeviceMatching::AllDevices => "all",
     }
 }
 
@@ -360,6 +399,8 @@ unsafe extern "C" fn hid_secondary_click_value_callback(
         );
     } else if is_contact_count_hid_usage(usage_page, usage) {
         update_hid_contact_count(state, integer_value);
+    } else {
+        log_unhandled_hid_usage(state, usage_page, usage, integer_value);
     }
 }
 

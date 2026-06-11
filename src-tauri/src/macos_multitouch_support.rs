@@ -3,15 +3,11 @@ use std::ffi::CString;
 pub(crate) type MTDeviceRef = *mut libc::c_void;
 type CFArrayRef = *const libc::c_void;
 type CFIndex = isize;
-pub(crate) type MTContactCallback = unsafe extern "C" fn(
-    MTDeviceRef,
-    *mut libc::c_void,
-    libc::size_t,
-    libc::c_double,
-    libc::size_t,
-);
+pub(crate) type MTContactCallback =
+    unsafe extern "C" fn(MTDeviceRef, *mut libc::c_void, libc::c_int, libc::c_double, libc::c_int);
 type MTDeviceCreateDefault = unsafe extern "C" fn() -> MTDeviceRef;
 type MTDeviceCreateList = unsafe extern "C" fn() -> CFArrayRef;
+type MTDeviceIsAvailable = unsafe extern "C" fn() -> bool;
 type MTRegisterContactFrameCallback = unsafe extern "C" fn(MTDeviceRef, MTContactCallback);
 type MTDeviceStart = unsafe extern "C" fn(MTDeviceRef, libc::c_int) -> libc::c_int;
 
@@ -42,12 +38,14 @@ impl MultitouchSupportRuntime {
             unsafe { load_optional_symbol(handle, b"MTDeviceCreateList\0") };
         let create_default: Option<MTDeviceCreateDefault> =
             unsafe { load_optional_symbol(handle, b"MTDeviceCreateDefault\0") };
+        let device_is_available: Option<MTDeviceIsAvailable> =
+            unsafe { load_optional_symbol(handle, b"MTDeviceIsAvailable\0") };
         let register_callback: MTRegisterContactFrameCallback =
             unsafe { load_symbol(handle, b"MTRegisterContactFrameCallback\0")? };
         let device_start: MTDeviceStart = unsafe { load_symbol(handle, b"MTDeviceStart\0")? };
 
         let (devices, device_list) =
-            unsafe { create_multitouch_devices(create_list, create_default)? };
+            unsafe { create_multitouch_devices(create_list, create_default, device_is_available)? };
         let mut started_device_count = 0usize;
 
         for &device in &devices {
@@ -83,9 +81,17 @@ impl MultitouchSupportRuntime {
 unsafe fn create_multitouch_devices(
     create_list: Option<MTDeviceCreateList>,
     create_default: Option<MTDeviceCreateDefault>,
+    device_is_available: Option<MTDeviceIsAvailable>,
 ) -> Result<(Vec<MTDeviceRef>, Option<CFArrayRef>), String> {
     let mut devices = Vec::new();
     let mut device_list = None;
+
+    if multitouch_default_device_is_available(device_is_available) {
+        if let Some(create_default) = create_default {
+            let device = unsafe { create_default() };
+            push_unique_device(&mut devices, device);
+        }
+    }
 
     if let Some(create_list) = create_list {
         let list = unsafe { create_list() };
@@ -99,16 +105,19 @@ unsafe fn create_multitouch_devices(
         }
     }
 
-    if let Some(create_default) = create_default {
-        let device = unsafe { create_default() };
-        push_unique_device(&mut devices, device);
-    }
-
     if devices.is_empty() {
         return Err("no MultitouchSupport devices available".to_string());
     }
 
     Ok((devices, device_list))
+}
+
+fn multitouch_default_device_is_available(
+    device_is_available: Option<MTDeviceIsAvailable>,
+) -> bool {
+    device_is_available
+        .map(|is_available| unsafe { is_available() })
+        .unwrap_or(true)
 }
 
 fn push_unique_device(devices: &mut Vec<MTDeviceRef>, device: MTDeviceRef) {
@@ -164,6 +173,18 @@ mod tests {
         assert!(mt_status_is_success(0));
         assert!(!mt_status_is_success(-1));
         assert!(!mt_status_is_success(1));
+    }
+
+    unsafe extern "C" fn unavailable_default_device() -> bool {
+        false
+    }
+
+    #[test]
+    fn default_device_availability_is_optimistic_without_symbol() {
+        assert!(multitouch_default_device_is_available(None));
+        assert!(!multitouch_default_device_is_available(Some(
+            unavailable_default_device
+        )));
     }
 
     #[test]

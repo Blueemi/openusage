@@ -7,6 +7,7 @@ pub(super) const HID_USAGE_BUTTON_SECONDARY: u32 = 0x02;
 pub(super) const HID_USAGE_PAGE_DIGITIZER_U32: u32 = 0x0d;
 pub(super) const HID_USAGE_DIGITIZER_CONTACT_COUNT: u32 = 0x54;
 pub(super) const HID_RECENT_TWO_CONTACT_MILLIS: u64 = 240;
+const MAX_UNHANDLED_USAGE_LOGS: usize = 24;
 
 #[derive(Debug)]
 pub(super) struct HidSecondaryClickState {
@@ -15,6 +16,7 @@ pub(super) struct HidSecondaryClickState {
     pub(super) contact_count: AtomicUsize,
     pub(super) last_two_contact_millis: AtomicU64,
     value_frames: AtomicU64,
+    unhandled_usage_logs: AtomicUsize,
     pub(super) runtime_started: AtomicBool,
 }
 
@@ -26,6 +28,7 @@ impl HidSecondaryClickState {
             contact_count: AtomicUsize::new(0),
             last_two_contact_millis: AtomicU64::new(0),
             value_frames: AtomicU64::new(0),
+            unhandled_usage_logs: AtomicUsize::new(0),
             runtime_started: AtomicBool::new(false),
         }
     }
@@ -59,6 +62,30 @@ pub(super) fn update_hid_contact_count(
     if previous != contact_count {
         log::debug!("tray context menu: IOHID contact_count={contact_count}");
     }
+}
+
+pub(super) fn log_unhandled_hid_usage(
+    state: &HidSecondaryClickState,
+    usage_page: u32,
+    usage: u32,
+    integer_value: libc::c_long,
+) {
+    if !should_log_unhandled_hid_usage(integer_value) {
+        return;
+    }
+
+    let count = state.unhandled_usage_logs.fetch_add(1, Ordering::Relaxed);
+    if count >= MAX_UNHANDLED_USAGE_LOGS {
+        return;
+    }
+
+    log::warn!(
+        "tray context menu: IOHID unhandled usage page=0x{usage_page:x} usage=0x{usage:x} value={integer_value}"
+    );
+}
+
+pub(super) fn should_log_unhandled_hid_usage(integer_value: libc::c_long) -> bool {
+    integer_value != 0
 }
 
 pub(super) fn is_button_hid_usage(usage_page: u32, usage: u32, expected_usage: u32) -> bool {

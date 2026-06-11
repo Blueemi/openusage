@@ -58,6 +58,12 @@ fn hid_contact_count_normalizes_negative_values() {
 }
 
 #[test]
+fn hid_unhandled_usage_logging_skips_zero_values() {
+    assert!(should_log_unhandled_hid_usage(1));
+    assert!(!should_log_unhandled_hid_usage(0));
+}
+
+#[test]
 fn iohid_zero_status_is_success() {
     assert!(iohid_status_is_success(0));
     assert!(!iohid_status_is_success(1));

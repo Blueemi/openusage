@@ -56,6 +56,7 @@ fn recent_raw_two_finger_seen_covers_fast_taps() {
 #[test]
 fn raw_trackpad_callback_logs_first_frame_and_finger_changes() {
     assert_eq!(normalize_raw_active_fingers(2), 2);
+    assert_eq!(normalize_raw_active_fingers(-1), 0);
     assert!(should_log_raw_callback_frame(1, 0, 0));
     assert!(should_log_raw_callback_frame(2, 1, 2));
     assert!(!should_log_raw_callback_frame(2, 2, 2));
