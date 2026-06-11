@@ -5,10 +5,13 @@ type CFArrayRef = *const libc::c_void;
 type CFIndex = isize;
 pub(crate) type MTContactCallback =
     unsafe extern "C" fn(MTDeviceRef, *mut libc::c_void, libc::c_int, libc::c_double, libc::c_int);
+pub(crate) type MTPathCallback =
+    unsafe extern "C" fn(MTDeviceRef, libc::c_long, libc::c_long, *mut libc::c_void);
 type MTDeviceCreateDefault = unsafe extern "C" fn() -> MTDeviceRef;
 type MTDeviceCreateList = unsafe extern "C" fn() -> CFArrayRef;
 type MTDeviceIsAvailable = unsafe extern "C" fn() -> bool;
 type MTRegisterContactFrameCallback = unsafe extern "C" fn(MTDeviceRef, MTContactCallback);
+type MTRegisterPathCallback = unsafe extern "C" fn(MTDeviceRef, MTPathCallback);
 type MTDeviceStart = unsafe extern "C" fn(MTDeviceRef, libc::c_int) -> libc::c_int;
 
 const MULTITOUCH_FRAMEWORK_PATH: &str =
@@ -27,7 +30,10 @@ pub(crate) struct MultitouchSupportRuntime {
 }
 
 impl MultitouchSupportRuntime {
-    pub(crate) unsafe fn start(callback: MTContactCallback) -> Result<Self, String> {
+    pub(crate) unsafe fn start(
+        contact_callback: MTContactCallback,
+        path_callback: Option<MTPathCallback>,
+    ) -> Result<Self, String> {
         let path = CString::new(MULTITOUCH_FRAMEWORK_PATH).expect("valid framework path");
         let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW) };
         if handle.is_null() {
@@ -42,6 +48,10 @@ impl MultitouchSupportRuntime {
             unsafe { load_optional_symbol(handle, b"MTDeviceIsAvailable\0") };
         let register_callback: MTRegisterContactFrameCallback =
             unsafe { load_symbol(handle, b"MTRegisterContactFrameCallback\0")? };
+        let register_path_callback: Option<MTRegisterPathCallback> =
+            unsafe { load_optional_symbol(handle, b"MTRegisterPathCallback\0") };
+        let should_register_path_callback =
+            register_path_callback.is_some() && path_callback.is_some();
         let device_start: MTDeviceStart = unsafe { load_symbol(handle, b"MTDeviceStart\0")? };
 
         let (devices, device_list) =
@@ -50,7 +60,12 @@ impl MultitouchSupportRuntime {
 
         for &device in &devices {
             unsafe {
-                register_callback(device, callback);
+                register_callback(device, contact_callback);
+                if let (Some(register_path_callback), Some(path_callback)) =
+                    (register_path_callback, path_callback)
+                {
+                    register_path_callback(device, path_callback);
+                }
                 let start_status = device_start(device, 0);
                 if mt_status_is_success(start_status) {
                     started_device_count += 1;
@@ -64,6 +79,9 @@ impl MultitouchSupportRuntime {
 
         if started_device_count == 0 {
             return Err("no MultitouchSupport devices started".to_string());
+        }
+        if should_register_path_callback {
+            log::warn!("tray context menu: registered raw trackpad path callback");
         }
 
         Ok(Self {

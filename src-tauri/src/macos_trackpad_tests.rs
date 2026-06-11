@@ -63,6 +63,33 @@ fn raw_trackpad_callback_logs_first_frame_and_finger_changes() {
 }
 
 #[test]
+fn raw_trackpad_path_states_track_active_fingers() {
+    assert!(raw_trackpad_path_state_is_active(
+        RAW_TRACKPAD_PATH_STATE_START_IN_RANGE
+    ));
+    assert!(raw_trackpad_path_state_is_active(
+        RAW_TRACKPAD_PATH_STATE_TOUCHING
+    ));
+    assert!(!raw_trackpad_path_state_is_active(5));
+    assert_eq!(raw_trackpad_path_bit(0), Some(1));
+    assert_eq!(raw_trackpad_path_bit(2), Some(4));
+    assert_eq!(raw_trackpad_path_bit(-1), None);
+    assert_eq!(raw_trackpad_path_bit(64), None);
+}
+
+#[test]
+fn raw_trackpad_path_callback_accepts_current_multitouch_abi() {
+    unsafe {
+        raw_trackpad_path_callback(
+            std::ptr::null_mut(),
+            0,
+            RAW_TRACKPAD_PATH_STATE_TOUCHING,
+            std::ptr::null_mut(),
+        );
+    }
+}
+
+#[test]
 fn raw_trackpad_callback_accepts_current_multitouch_abi() {
     unsafe {
         raw_trackpad_contact_callback(std::ptr::null_mut(), std::ptr::null_mut(), 0, 0.0, 0);

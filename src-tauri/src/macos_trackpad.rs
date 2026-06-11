@@ -8,11 +8,18 @@ use objc2_app_kit::{NSMenu, NSView};
 
 const RAW_TRACKPAD_IDLE_END_MILLIS: u64 = 160;
 const RAW_TRACKPAD_RECENT_TWO_FINGER_MILLIS: u64 = 300;
+const RAW_TRACKPAD_PATH_STATE_START_IN_RANGE: libc::c_long = 1;
+const RAW_TRACKPAD_PATH_STATE_HOVER_IN_RANGE: libc::c_long = 2;
+const RAW_TRACKPAD_PATH_STATE_MAKE_TOUCH: libc::c_long = 3;
+const RAW_TRACKPAD_PATH_STATE_TOUCHING: libc::c_long = 4;
+const RAW_TRACKPAD_MAX_PATHS: libc::c_long = 63;
 
 #[derive(Debug)]
 struct RawTrackpadTouchState {
     active_fingers: AtomicUsize,
+    active_path_mask: AtomicU64,
     callback_frames: AtomicU64,
+    path_frames: AtomicU64,
     last_update_millis: AtomicU64,
     last_two_finger_millis: AtomicU64,
     runtime_started: AtomicBool,
@@ -22,7 +29,9 @@ impl RawTrackpadTouchState {
     fn new() -> Self {
         Self {
             active_fingers: AtomicUsize::new(0),
+            active_path_mask: AtomicU64::new(0),
             callback_frames: AtomicU64::new(0),
+            path_frames: AtomicU64::new(0),
             last_update_millis: AtomicU64::new(0),
             last_two_finger_millis: AtomicU64::new(0),
             runtime_started: AtomicBool::new(false),
@@ -59,7 +68,12 @@ fn start_raw_trackpad_listener(touch_state: &RawTrackpadTouchState) -> bool {
         return true;
     }
 
-    match unsafe { MultitouchSupportRuntime::start(raw_trackpad_contact_callback) } {
+    match unsafe {
+        MultitouchSupportRuntime::start(
+            raw_trackpad_contact_callback,
+            Some(raw_trackpad_path_callback),
+        )
+    } {
         Ok(runtime) => {
             let device_count = runtime.device_count();
             std::mem::forget(runtime);
@@ -184,6 +198,48 @@ unsafe extern "C" fn raw_trackpad_contact_callback(
     }
 }
 
+unsafe extern "C" fn raw_trackpad_path_callback(
+    _device: MTDeviceRef,
+    path_id: libc::c_long,
+    path_state: libc::c_long,
+    _touch: *mut libc::c_void,
+) {
+    if let Some(state) = RAW_TRACKPAD_TOUCH_STATE.get() {
+        let Some(path_bit) = raw_trackpad_path_bit(path_id) else {
+            return;
+        };
+        let previous_mask = state.active_path_mask.load(Ordering::SeqCst);
+        let next_mask = if raw_trackpad_path_state_is_active(path_state) {
+            previous_mask | path_bit
+        } else {
+            previous_mask & !path_bit
+        };
+        state.active_path_mask.store(next_mask, Ordering::SeqCst);
+
+        let active_paths = next_mask.count_ones() as usize;
+        let now_millis = raw_trackpad_elapsed_millis();
+        let path_frames = state.path_frames.fetch_add(1, Ordering::SeqCst) + 1;
+        let previous = state.active_fingers.swap(active_paths, Ordering::SeqCst);
+        state.last_update_millis.store(now_millis, Ordering::SeqCst);
+        if active_paths >= 2 {
+            state
+                .last_two_finger_millis
+                .store(now_millis, Ordering::SeqCst);
+        }
+        if should_log_raw_path_frame(path_frames, previous, active_paths) {
+            if path_frames == 1 {
+                log::warn!(
+                    "tray context menu: raw trackpad path active_fingers={active_paths} state={path_state}"
+                );
+            } else {
+                log::debug!(
+                    "tray context menu: raw trackpad path active_fingers={active_paths} state={path_state}"
+                );
+            }
+        }
+    }
+}
+
 fn normalize_raw_active_fingers(active_fingers: libc::c_int) -> usize {
     usize::try_from(active_fingers.max(0)).unwrap_or(0)
 }
@@ -194,6 +250,30 @@ fn should_log_raw_callback_frame(
     active_fingers: usize,
 ) -> bool {
     callback_frames == 1 || previous_active_fingers != active_fingers
+}
+
+fn should_log_raw_path_frame(
+    path_frames: u64,
+    previous_active_fingers: usize,
+    active_fingers: usize,
+) -> bool {
+    path_frames == 1 || previous_active_fingers != active_fingers
+}
+
+fn raw_trackpad_path_state_is_active(path_state: libc::c_long) -> bool {
+    matches!(
+        path_state,
+        RAW_TRACKPAD_PATH_STATE_START_IN_RANGE
+            | RAW_TRACKPAD_PATH_STATE_HOVER_IN_RANGE
+            | RAW_TRACKPAD_PATH_STATE_MAKE_TOUCH
+            | RAW_TRACKPAD_PATH_STATE_TOUCHING
+    )
+}
+
+fn raw_trackpad_path_bit(path_id: libc::c_long) -> Option<u64> {
+    (0..=RAW_TRACKPAD_MAX_PATHS)
+        .contains(&path_id)
+        .then(|| 1u64 << path_id)
 }
 
 fn current_raw_active_fingers(state: &RawTrackpadTouchState, now_millis: u64) -> usize {
