@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, ContextMenu, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::path::BaseDirectory;
@@ -320,11 +322,8 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
     if let Err(error) = tray.with_inner_tray_icon(move |inner| {
         use muda::ContextMenu as _;
         use objc2::ClassType;
-        use objc2_app_kit::{NSEvent, NSMenu, NSView};
+        use objc2_app_kit::{NSMenu, NSView};
         use objc2_foundation::MainThreadMarker;
-        use std::cell::Cell;
-        use std::ptr;
-        use std::ptr::NonNull;
 
         let Some(mtm) = MainThreadMarker::new() else {
             log::warn!("tray context menu: not on main thread");
@@ -349,149 +348,21 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
             }
         };
         let ns_menu = unsafe { &*(menu.ns_menu().cast::<NSMenu>()) };
-        let local_ns_menu = ns_menu.retain();
         let button_view: &NSView = button.as_super().as_super().as_super();
         crate::macos_status_item_icon::install_native_button(&status_item, &button);
-        let installed_custom_status_view = false;
         let status_view = button_view.retain();
         let status_view: &NSView = &status_view;
-        let local_status_view = status_view.retain();
         set_context_menu_on_view_tree(status_view, ns_menu);
         update_native_tray_rect_from_view(status_view);
         install_status_item_system_menu(&app_handle, ns_menu, &status_item, status_view);
-        if !installed_custom_status_view {
-            install_status_button_action_target(ns_menu, &status_item, &button);
-            install_status_view_context_click_gestures(ns_menu, &status_item, status_view);
-            install_tray_input_view(&app_handle, ns_menu, status_view);
-        }
-
-        let Some(window) = status_view.window() else {
-            log::warn!("tray context menu: status item window unavailable");
-            std::mem::forget(menu);
-            return;
-        };
-        if should_install_tray_input_overlay_window(installed_custom_status_view) {
-            install_tray_input_overlay_window(&app_handle, ns_menu, status_view);
-        }
-
-        let status_window_number = window.windowNumber();
-        let global_ns_menu = ns_menu.retain();
-        let global_status_view = status_view.retain();
         install_status_item_event_tap(ns_menu, status_view);
         install_secondary_click_poll_timer(ns_menu, status_view);
         crate::macos_hid_secondary_click::install(ns_menu, status_view);
         crate::macos_trackpad::install_context_click_fallback(ns_menu, status_view);
-        log::debug!("tray context menu: installed on status button view tree");
+        log::debug!("tray context menu: using AppKit status menu without overlay");
 
-        let last_event_number = Cell::new(-1);
-        let local_two_touch_menu_open = Cell::new(false);
-        let local_app_handle = app_handle.clone();
-        let block = block2::RcBlock::new(move |event_ptr: NonNull<NSEvent>| -> *mut NSEvent {
-            let event = unsafe { event_ptr.as_ref() };
-            if event.windowNumber() != status_window_number {
-                return event_ptr.as_ptr();
-            }
-
-            let touch_count = active_touch_count_for_event(event, &local_status_view);
-            if should_open_tray_menu_from_touch_count(local_two_touch_menu_open.get(), touch_count)
-            {
-                local_two_touch_menu_open.set(true);
-                log::debug!(
-                    "tray context menu: opening from two-touch status item event touch_count={touch_count}"
-                );
-                show_native_tray_menu_at_view(&local_ns_menu, &local_status_view);
-                return ptr::null_mut();
-            }
-            if should_reset_touch_menu_gate(touch_count) {
-                local_two_touch_menu_open.set(false);
-            }
-
-            if should_handle_primary_status_item_click(event) {
-                match primary_status_item_click_action(
-                    event,
-                    native_menu_recently_opened_for_mouse_up(std::time::Instant::now()),
-                ) {
-                    PrimaryStatusItemClickAction::TogglePanel => {
-                        update_native_tray_rect_from_view(&local_status_view);
-                        toggle_panel(&local_app_handle);
-                    }
-                    PrimaryStatusItemClickAction::Ignore => {}
-                    PrimaryStatusItemClickAction::PassThrough => return event_ptr.as_ptr(),
-                }
-                return ptr::null_mut();
-            }
-
-            if !should_open_tray_menu_from_native_event(event) {
-                return event_ptr.as_ptr();
-            }
-
-            let event_number = event.eventNumber();
-            if event_number == last_event_number.get() {
-                return ptr::null_mut();
-            }
-            last_event_number.set(event_number);
-
-            show_native_tray_menu_at_view(&local_ns_menu, &local_status_view);
-
-            ptr::null_mut()
-        });
-        let block_ref: &block2::DynBlock<dyn Fn(NonNull<NSEvent>) -> *mut NSEvent> = &block;
-        let mask = status_item_native_event_monitor_mask();
-        let token =
-            unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, block_ref) };
-        if let Some(token) = token {
-            std::mem::forget(token);
-        } else {
-            log::warn!("tray context menu: AppKit did not install event monitor");
-        }
-
-        let last_global_event_number = Cell::new(-1);
-        let global_two_touch_menu_open = Cell::new(false);
-        let global_block = block2::RcBlock::new(move |event_ptr: NonNull<NSEvent>| {
-            let event = unsafe { event_ptr.as_ref() };
-            if !is_mouse_inside_status_view(&global_status_view) {
-                return;
-            }
-
-            let touch_count = active_touch_count_for_event(event, &global_status_view);
-            if should_open_tray_menu_from_touch_count(global_two_touch_menu_open.get(), touch_count)
-            {
-                global_two_touch_menu_open.set(true);
-                log::debug!(
-                    "tray context menu: opening from global two-touch event touch_count={touch_count}"
-                );
-                show_native_tray_menu_at_view(&global_ns_menu, &global_status_view);
-                return;
-            }
-            if should_reset_touch_menu_gate(touch_count) {
-                global_two_touch_menu_open.set(false);
-            }
-
-            if !should_open_tray_menu_from_native_event(event) {
-                return;
-            }
-
-            let event_number = event.eventNumber();
-            if event_number != 0 && event_number == last_global_event_number.get() {
-                return;
-            }
-            last_global_event_number.set(event_number);
-
-            show_native_tray_menu_at_view(&global_ns_menu, &global_status_view);
-        });
-        let global_block_ref: &block2::DynBlock<dyn Fn(NonNull<NSEvent>)> = &global_block;
-        let global_token =
-            NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, global_block_ref);
-        if let Some(global_token) = global_token {
-            std::mem::forget(global_token);
-        } else {
-            log::warn!("tray context menu: AppKit did not install global event monitor");
-        }
-
-        // NSMenu keeps a weak delegate; keep all native monitor state alive.
+        // NSStatusItem keeps the menu, and NSMenu keeps a weak delegate.
         std::mem::forget(menu);
-        std::mem::forget(block);
-        std::mem::forget(global_block);
     }) {
         log::warn!("tray context menu: failed to install native menu: {error}");
     }
