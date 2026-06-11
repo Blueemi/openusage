@@ -8,6 +8,7 @@ use tauri::AppHandle;
 
 pub(crate) const STATUS_ITEM_WIDTH: f64 = 24.0;
 pub(crate) const STATUS_ITEM_HEIGHT: f64 = 22.0;
+pub(crate) const STATUS_ITEM_MENU_BAR_HIT_HEIGHT: f64 = 30.0;
 const STATUS_ITEM_ICON_SIZE: f64 = 18.0;
 const STATUS_ITEM_HORIZONTAL_PADDING: f64 = 6.0;
 
@@ -140,7 +141,7 @@ fn status_item_image_display_size(width: u32, height: u32) -> NSSize {
 fn status_item_size_for_icon_size(icon_size: NSSize) -> NSSize {
     NSSize::new(
         (icon_size.width + STATUS_ITEM_HORIZONTAL_PADDING).max(STATUS_ITEM_WIDTH),
-        STATUS_ITEM_HEIGHT.max(icon_size.height),
+        STATUS_ITEM_MENU_BAR_HIT_HEIGHT.max(icon_size.height),
     )
 }
 
@@ -191,9 +192,9 @@ mod tests {
 
     #[test]
     fn custom_status_view_uses_stable_icon_frame() {
-        let frame = initial_image_frame(NSSize::new(24.0, 22.0));
+        let frame = initial_image_frame(NSSize::new(24.0, 30.0));
         assert_eq!(frame.origin.x, 3.0);
-        assert_eq!(frame.origin.y, 2.0);
+        assert_eq!(frame.origin.y, 6.0);
         assert_eq!(frame.size.width, 18.0);
         assert_eq!(frame.size.height, 18.0);
     }
@@ -207,8 +208,9 @@ mod tests {
         assert_eq!(image_size.height, 18.0);
         assert_eq!(image_size.width, 42.0);
         assert_eq!(item_size.width, 48.0);
+        assert_eq!(item_size.height, 30.0);
         assert_eq!(frame.origin.x, 3.0);
-        assert_eq!(frame.origin.y, 2.0);
+        assert_eq!(frame.origin.y, 6.0);
     }
 
     #[test]

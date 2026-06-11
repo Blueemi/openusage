@@ -1,4 +1,6 @@
-use crate::macos_status_item_icon::{STATUS_ITEM_HEIGHT, STATUS_ITEM_WIDTH, initial_image_frame};
+use crate::macos_status_item_icon::{
+    STATUS_ITEM_HEIGHT, STATUS_ITEM_MENU_BAR_HIT_HEIGHT, STATUS_ITEM_WIDTH, initial_image_frame,
+};
 use objc2::{ClassType, DeclaredClass, Message, msg_send};
 use objc2_app_kit::{
     NSEvent, NSEventModifierFlags, NSEventType, NSImage, NSImageScaling, NSImageView, NSMenu,
@@ -284,7 +286,9 @@ fn should_reset_touch_gate(touch_count: usize) -> bool {
 fn normalized_status_item_size(size: NSSize) -> NSSize {
     NSSize::new(
         size.width.max(STATUS_ITEM_WIDTH),
-        size.height.max(STATUS_ITEM_HEIGHT),
+        size.height
+            .max(STATUS_ITEM_HEIGHT)
+            .max(STATUS_ITEM_MENU_BAR_HIT_HEIGHT),
     )
 }
 
@@ -327,5 +331,13 @@ mod tests {
         assert!(!should_open_from_touch_count(false, 1));
         assert!(should_reset_touch_gate(1));
         assert!(!should_reset_touch_gate(2));
+    }
+
+    #[test]
+    fn custom_status_view_uses_full_menu_bar_hit_height() {
+        let size = normalized_status_item_size(NSSize::new(24.0, 22.0));
+
+        assert_eq!(size.width, 24.0);
+        assert_eq!(size.height, 30.0);
     }
 }

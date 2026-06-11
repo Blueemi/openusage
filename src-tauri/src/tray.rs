@@ -19,8 +19,6 @@ const LOG_LEVEL_STORE_KEY: &str = "logLevel";
 const STATUS_ITEM_HORIZONTAL_HIT_PADDING: f64 = 3.0;
 #[cfg(target_os = "macos")]
 const STATUS_ITEM_VERTICAL_HIT_PADDING: f64 = 12.0;
-#[cfg(target_os = "macos")]
-const STATUS_ITEM_TAHOE_MENU_BAR_HIT_HEIGHT: f64 = 30.0;
 
 fn should_open_tray_menu(button: MouseButton, button_state: MouseButtonState) -> bool {
     #[cfg(target_os = "macos")]
@@ -1237,7 +1235,8 @@ fn screen_top_y_for_status_frame(status_frame: objc2_foundation::NSRect) -> f64 
         .map(|screen| screen.frame().origin.y + screen.frame().size.height)
         .filter(|screen_top_y| {
             let status_top_y = status_frame.origin.y + status_frame.size.height;
-            (screen_top_y - status_top_y).abs() <= STATUS_ITEM_TAHOE_MENU_BAR_HIT_HEIGHT
+            (screen_top_y - status_top_y).abs()
+                <= crate::macos_status_item_icon::STATUS_ITEM_MENU_BAR_HIT_HEIGHT
         })
         .unwrap_or(status_frame.origin.y + status_frame.size.height)
 }
@@ -1249,7 +1248,8 @@ fn tray_input_overlay_window_frame(
 ) -> objc2_foundation::NSRect {
     let status_top_y = status_frame.origin.y + status_frame.size.height;
     let top_y = if screen_top_y >= status_top_y
-        && screen_top_y - status_top_y <= STATUS_ITEM_TAHOE_MENU_BAR_HIT_HEIGHT
+        && screen_top_y - status_top_y
+            <= crate::macos_status_item_icon::STATUS_ITEM_MENU_BAR_HIT_HEIGHT
     {
         screen_top_y
     } else {
@@ -1258,7 +1258,7 @@ fn tray_input_overlay_window_frame(
     let height = status_frame
         .size
         .height
-        .max(STATUS_ITEM_TAHOE_MENU_BAR_HIT_HEIGHT);
+        .max(crate::macos_status_item_icon::STATUS_ITEM_MENU_BAR_HIT_HEIGHT);
     let bottom_y = top_y - height;
 
     objc2_foundation::NSRect::new(
