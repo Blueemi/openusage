@@ -19,6 +19,11 @@ const LOG_LEVEL_STORE_KEY: &str = "logLevel";
 const STATUS_ITEM_HORIZONTAL_HIT_PADDING: f64 = 3.0;
 #[cfg(target_os = "macos")]
 const STATUS_ITEM_VERTICAL_HIT_PADDING: f64 = 12.0;
+#[cfg(target_os = "macos")]
+const MAX_TRAY_OVERLAY_EVENT_LOGS: usize = 24;
+#[cfg(target_os = "macos")]
+static TRAY_OVERLAY_EVENT_LOGS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 fn should_open_tray_menu(button: MouseButton, button_state: MouseButtonState) -> bool {
     #[cfg(target_os = "macos")]
@@ -906,6 +911,7 @@ objc2::define_class!(
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &objc2_app_kit::NSEvent) {
             self.update_tray_rect();
+            self.log_event("mouseDown", event);
             if self.should_open_context_menu_from_event(event) {
                 self.ivars().suppress_next_mouse_up.set(true);
                 self.open_context_menu_for_event(event);
@@ -915,6 +921,7 @@ objc2::define_class!(
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, event: &objc2_app_kit::NSEvent) {
             self.update_tray_rect();
+            self.log_event("mouseUp", event);
             if self.should_open_context_menu_from_event(event) {
                 self.ivars().suppress_next_mouse_up.set(false);
                 self.open_context_menu_for_event(event);
@@ -931,24 +938,32 @@ objc2::define_class!(
 
         #[unsafe(method(rightMouseDown:))]
         fn right_mouse_down(&self, event: &objc2_app_kit::NSEvent) {
+            self.log_event("rightMouseDown", event);
+            self.ivars().suppress_next_mouse_up.set(true);
             self.open_context_menu_for_event(event);
         }
 
         #[unsafe(method(rightMouseUp:))]
         fn right_mouse_up(&self, event: &objc2_app_kit::NSEvent) {
+            self.log_event("rightMouseUp", event);
+            self.ivars().suppress_next_mouse_up.set(true);
             self.open_context_menu_for_event(event);
         }
 
         #[unsafe(method(otherMouseDown:))]
         fn other_mouse_down(&self, event: &objc2_app_kit::NSEvent) {
+            self.log_event("otherMouseDown", event);
             if event.buttonNumber() > 0 {
+                self.ivars().suppress_next_mouse_up.set(true);
                 self.open_context_menu_for_event(event);
             }
         }
 
         #[unsafe(method(otherMouseUp:))]
         fn other_mouse_up(&self, event: &objc2_app_kit::NSEvent) {
+            self.log_event("otherMouseUp", event);
             if event.buttonNumber() > 0 {
+                self.ivars().suppress_next_mouse_up.set(true);
                 self.open_context_menu_for_event(event);
             }
         }
@@ -1014,14 +1029,14 @@ objc2::define_class!(
             event: &objc2_app_kit::NSEvent,
         ) -> Option<&'static objc2_app_kit::NSMenu> {
             if self.should_open_context_menu_from_event(event) {
-                self.update_tray_rect();
-                Some(unsafe {
-                    &*(objc2::rc::Retained::as_ptr(&self.ivars().menu)
-                        as *const objc2_app_kit::NSMenu)
-                })
+                self.log_event("menuForEvent", event);
+                self.ivars().suppress_next_mouse_up.set(true);
+                self.open_context_menu_for_event(event);
             } else {
-                None
+                self.log_event("menuForEventIgnored", event);
             }
+
+            None
         }
     }
 );
@@ -1049,12 +1064,12 @@ impl TrayInputOverlayView {
             return;
         }
 
-        log::debug!("tray context menu: showing native context menu for event");
-        objc2_app_kit::NSMenu::popUpContextMenu_withEvent_forView(
-            &self.ivars().menu,
-            event,
-            self.as_view(),
+        log::warn!(
+            "tray context menu: overlay opening menu event_type={:?} button={}",
+            event.r#type(),
+            event.buttonNumber()
         );
+        show_native_tray_menu_at_view(&self.ivars().menu, &self.ivars().status_view);
     }
 
     fn handle_touch_event(&self, event: &objc2_app_kit::NSEvent) {
@@ -1080,6 +1095,21 @@ impl TrayInputOverlayView {
                 self.ivars().two_touch_menu_open.get(),
                 active_touch_count_for_event(event, self.as_view()),
             )
+    }
+
+    fn log_event(&self, label: &str, event: &objc2_app_kit::NSEvent) {
+        let count = TRAY_OVERLAY_EVENT_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count >= MAX_TRAY_OVERLAY_EVENT_LOGS {
+            return;
+        }
+
+        log::warn!(
+            "tray context menu: overlay {label} event_type={:?} button={} touches={} pressed_buttons={}",
+            event.r#type(),
+            event.buttonNumber(),
+            active_touch_count_for_event(event, self.as_view()),
+            objc2_app_kit::NSEvent::pressedMouseButtons()
+        );
     }
 }
 
