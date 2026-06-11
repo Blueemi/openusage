@@ -9,13 +9,8 @@ use objc2_app_kit::{NSMenu, NSView};
 type MTDeviceRef = *mut libc::c_void;
 type CFArrayRef = *const libc::c_void;
 type CFIndex = isize;
-type MTContactCallback = unsafe extern "C" fn(
-    libc::c_int,
-    *mut libc::c_void,
-    libc::c_int,
-    libc::c_double,
-    libc::c_int,
-) -> libc::c_int;
+type MTContactCallback =
+    unsafe extern "C" fn(MTDeviceRef, *mut libc::c_void, usize, libc::c_double, usize);
 type MTDeviceCreateDefault = unsafe extern "C" fn() -> MTDeviceRef;
 type MTDeviceCreateList = unsafe extern "C" fn() -> CFArrayRef;
 type MTRegisterContactFrameCallback = unsafe extern "C" fn(MTDeviceRef, MTContactCallback);
@@ -35,6 +30,7 @@ unsafe extern "C" {
 #[derive(Debug)]
 struct RawTrackpadTouchState {
     active_fingers: AtomicUsize,
+    callback_frames: AtomicU64,
     last_update_millis: AtomicU64,
     last_two_finger_millis: AtomicU64,
     runtime_started: AtomicBool,
@@ -44,6 +40,7 @@ impl RawTrackpadTouchState {
     fn new() -> Self {
         Self {
             active_fingers: AtomicUsize::new(0),
+            callback_frames: AtomicU64::new(0),
             last_update_millis: AtomicU64::new(0),
             last_two_finger_millis: AtomicU64::new(0),
             runtime_started: AtomicBool::new(false),
@@ -281,15 +278,16 @@ fn dl_error() -> String {
 }
 
 unsafe extern "C" fn raw_trackpad_contact_callback(
-    _device: libc::c_int,
+    _device: MTDeviceRef,
     _touches: *mut libc::c_void,
-    active_fingers: libc::c_int,
+    active_fingers: usize,
     _timestamp: libc::c_double,
-    _frame: libc::c_int,
-) -> libc::c_int {
+    _frame: usize,
+) {
     if let Some(state) = RAW_TRACKPAD_TOUCH_STATE.get() {
-        let active_fingers = active_fingers.max(0) as usize;
+        let active_fingers = normalize_raw_active_fingers(active_fingers);
         let now_millis = raw_trackpad_elapsed_millis();
+        let callback_frames = state.callback_frames.fetch_add(1, Ordering::SeqCst) + 1;
         let previous = state.active_fingers.swap(active_fingers, Ordering::SeqCst);
         state.last_update_millis.store(now_millis, Ordering::SeqCst);
         if active_fingers >= 2 {
@@ -297,12 +295,28 @@ unsafe extern "C" fn raw_trackpad_contact_callback(
                 .last_two_finger_millis
                 .store(now_millis, Ordering::SeqCst);
         }
-        if previous != active_fingers {
-            log::debug!("tray context menu: raw trackpad active_fingers={active_fingers}");
+        if should_log_raw_callback_frame(callback_frames, previous, active_fingers) {
+            if callback_frames == 1 {
+                log::warn!(
+                    "tray context menu: raw trackpad callback active_fingers={active_fingers}"
+                );
+            } else {
+                log::debug!("tray context menu: raw trackpad active_fingers={active_fingers}");
+            }
         }
     }
+}
 
-    0
+fn normalize_raw_active_fingers(active_fingers: usize) -> usize {
+    active_fingers
+}
+
+fn should_log_raw_callback_frame(
+    callback_frames: u64,
+    previous_active_fingers: usize,
+    active_fingers: usize,
+) -> bool {
+    callback_frames == 1 || previous_active_fingers != active_fingers
 }
 
 fn current_raw_active_fingers(state: &RawTrackpadTouchState, now_millis: u64) -> usize {
