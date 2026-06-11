@@ -322,7 +322,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
     if let Err(error) = tray.with_inner_tray_icon(move |inner| {
         use muda::ContextMenu as _;
         use objc2::ClassType;
-        use objc2_app_kit::{NSMenu, NSView};
+        use objc2_app_kit::{NSButton, NSMenu, NSView};
         use objc2_foundation::MainThreadMarker;
 
         let Some(mtm) = MainThreadMarker::new() else {
@@ -349,27 +349,33 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         };
         let ns_menu = unsafe { &*(menu.ns_menu().cast::<NSMenu>()) };
         let button_view: &NSView = button.as_super().as_super().as_super();
-        crate::macos_status_item_icon::install_native_button(&status_item, &button);
-        let status_view = button_view.retain();
+        let button_control: &NSButton = button.as_super();
+        let button_image = button_control.image();
+        let status_size = button_view.bounds().size;
+        let Some(status_view) = crate::macos_status_item_view::install(
+            &app_handle,
+            ns_menu,
+            &status_item,
+            button_image.as_deref(),
+            status_size,
+        ) else {
+            log::warn!("tray context menu: custom status item view unavailable");
+            std::mem::forget(menu);
+            return;
+        };
         let status_view: &NSView = &status_view;
         set_context_menu_on_view_tree(status_view, ns_menu);
         accept_indirect_touch_events(status_view);
         update_native_tray_rect_from_view(status_view);
         status_item.setMenu(None);
-        install_status_button_action_target(
-            &app_handle,
-            ns_menu,
-            &status_item,
-            &button,
-            status_view,
-        );
         install_status_item_event_tap(ns_menu, status_view);
         install_secondary_click_poll_timer(ns_menu, status_view);
         crate::macos_hid_secondary_click::install(ns_menu, status_view);
         crate::macos_trackpad::install_context_click_fallback(ns_menu, status_view);
-        log::debug!("tray context menu: using status button actions without overlay");
+        log::debug!("tray context menu: using custom status item view without overlay");
 
         // Keep the muda menu alive for manually popped AppKit menu actions.
+        std::mem::forget(status_view.retain());
         std::mem::forget(menu);
     }) {
         log::warn!("tray context menu: failed to install native menu: {error}");

@@ -1,10 +1,10 @@
 use crate::macos_status_item_icon::{
     STATUS_ITEM_MENU_BAR_HIT_HEIGHT, STATUS_ITEM_WIDTH, initial_image_frame,
 };
-use objc2::{ClassType, DeclaredClass, Message, msg_send};
+use objc2::{ClassType, DeclaredClass, Message, msg_send, runtime::AnyObject};
 use objc2_app_kit::{
-    NSEvent, NSEventModifierFlags, NSEventType, NSImage, NSImageScaling, NSImageView, NSMenu,
-    NSStatusItem, NSView,
+    NSClickGestureRecognizer, NSEvent, NSEventModifierFlags, NSEventType, NSImage, NSImageScaling,
+    NSImageView, NSMenu, NSStatusItem, NSView,
 };
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -165,6 +165,18 @@ objc2::define_class!(
 
             None
         }
+
+        #[unsafe(method(openOpenUsageContextMenuFromGesture:))]
+        fn open_context_menu_from_gesture(&self, recognizer: &NSClickGestureRecognizer) {
+            self.ivars().suppress_next_mouse_up.set(true);
+            log::warn!(
+                "tray context menu: custom status view gesture button_mask={} touches={}",
+                recognizer.buttonMask(),
+                recognizer.numberOfTouchesRequired()
+            );
+            self.update_tray_rect();
+            crate::tray::show_native_tray_menu_at_view(&self.ivars().menu, self.as_view());
+        }
     }
 );
 
@@ -252,6 +264,8 @@ pub(crate) fn install(
     };
     let status_ns_view: &NSView = status_view.as_super();
     accept_indirect_touch_events(status_ns_view);
+    let target: &AnyObject = unsafe { &*(&*status_view as *const OpenUsageStatusItemView).cast() };
+    crate::macos_status_item_gestures::install_context_click_gestures(status_ns_view, target);
 
     let image_view = match image {
         Some(image) => NSImageView::imageViewWithImage(image, mtm),

@@ -43,6 +43,7 @@ pub(crate) fn install(status_item: &NSStatusItem, status_view: &NSView, image_vi
     });
 }
 
+#[allow(dead_code)]
 pub(crate) fn install_native_button(status_item: &NSStatusItem, button: &NSStatusBarButton) {
     CUSTOM_STATUS_VIEW_INSTALLED.store(true, Ordering::SeqCst);
     CUSTOM_STATUS_IMAGE_VIEW.with(|slot| {

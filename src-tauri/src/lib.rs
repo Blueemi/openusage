@@ -8,6 +8,8 @@ mod macos_hid_secondary_click;
 #[cfg(target_os = "macos")]
 mod macos_multitouch_support;
 #[cfg(target_os = "macos")]
+mod macos_status_item_gestures;
+#[cfg(target_os = "macos")]
 mod macos_status_item_icon;
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
