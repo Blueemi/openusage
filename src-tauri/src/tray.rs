@@ -1464,15 +1464,23 @@ fn install_status_item_event_tap(
 }
 
 #[cfg(target_os = "macos")]
-fn status_item_event_tap_specs() -> [(objc2_core_graphics::CGEventTapLocation, TrayEventTapMode); 3]
+fn status_item_event_tap_specs() -> [(objc2_core_graphics::CGEventTapLocation, TrayEventTapMode); 5]
 {
     use objc2_core_graphics::CGEventTapLocation;
 
     [
         (CGEventTapLocation::HIDEventTap, TrayEventTapMode::Active),
         (
+            CGEventTapLocation::HIDEventTap,
+            TrayEventTapMode::ListenOnly,
+        ),
+        (
             CGEventTapLocation::SessionEventTap,
             TrayEventTapMode::Active,
+        ),
+        (
+            CGEventTapLocation::SessionEventTap,
+            TrayEventTapMode::ListenOnly,
         ),
         (
             CGEventTapLocation::AnnotatedSessionEventTap,
@@ -2567,8 +2575,16 @@ mod tests {
         let specs = status_item_event_tap_specs();
         assert!(specs.contains(&(CGEventTapLocation::HIDEventTap, TrayEventTapMode::Active)));
         assert!(specs.contains(&(
+            CGEventTapLocation::HIDEventTap,
+            TrayEventTapMode::ListenOnly
+        )));
+        assert!(specs.contains(&(
             CGEventTapLocation::SessionEventTap,
             TrayEventTapMode::Active
+        )));
+        assert!(specs.contains(&(
+            CGEventTapLocation::SessionEventTap,
+            TrayEventTapMode::ListenOnly
         )));
         assert!(specs.contains(&(
             CGEventTapLocation::AnnotatedSessionEventTap,

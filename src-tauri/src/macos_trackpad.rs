@@ -1,31 +1,13 @@
-use std::ffi::CString;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use crate::macos_multitouch_support::{MTDeviceRef, MultitouchSupportRuntime};
 use objc2::Message;
 use objc2_app_kit::{NSMenu, NSView};
 
-type MTDeviceRef = *mut libc::c_void;
-type CFArrayRef = *const libc::c_void;
-type CFIndex = isize;
-type MTContactCallback =
-    unsafe extern "C" fn(MTDeviceRef, *mut libc::c_void, usize, libc::c_double, usize);
-type MTDeviceCreateDefault = unsafe extern "C" fn() -> MTDeviceRef;
-type MTDeviceCreateList = unsafe extern "C" fn() -> CFArrayRef;
-type MTRegisterContactFrameCallback = unsafe extern "C" fn(MTDeviceRef, MTContactCallback);
-type MTDeviceStart = unsafe extern "C" fn(MTDeviceRef, libc::c_int);
-
-const MULTITOUCH_FRAMEWORK_PATH: &str =
-    "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport";
 const RAW_TRACKPAD_IDLE_END_MILLIS: u64 = 160;
 const RAW_TRACKPAD_RECENT_TWO_FINGER_MILLIS: u64 = 300;
-
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    fn CFArrayGetCount(array: CFArrayRef) -> CFIndex;
-    fn CFArrayGetValueAtIndex(array: CFArrayRef, index: CFIndex) -> *const libc::c_void;
-}
 
 #[derive(Debug)]
 struct RawTrackpadTouchState {
@@ -58,12 +40,6 @@ struct RawTrackpadMenuTimerState {
     menu_opened_for_sequence: std::cell::Cell<bool>,
 }
 
-struct MultitouchSupportRuntime {
-    _handle: *mut libc::c_void,
-    _device_list: Option<CFArrayRef>,
-    _devices: Vec<MTDeviceRef>,
-}
-
 static RAW_TRACKPAD_TOUCH_STATE: OnceLock<Arc<RawTrackpadTouchState>> = OnceLock::new();
 
 pub(crate) fn install_context_click_fallback(menu: &NSMenu, status_view: &NSView) {
@@ -83,7 +59,7 @@ fn start_raw_trackpad_listener(touch_state: &RawTrackpadTouchState) -> bool {
         return true;
     }
 
-    match unsafe { MultitouchSupportRuntime::start() } {
+    match unsafe { MultitouchSupportRuntime::start(raw_trackpad_contact_callback) } {
         Ok(runtime) => {
             let device_count = runtime.device_count();
             std::mem::forget(runtime);
@@ -176,105 +152,6 @@ fn install_raw_trackpad_menu_timer(
     std::mem::forget(state);
     std::mem::forget(block);
     std::mem::forget(timer);
-}
-
-impl MultitouchSupportRuntime {
-    unsafe fn start() -> Result<Self, String> {
-        let path = CString::new(MULTITOUCH_FRAMEWORK_PATH).expect("valid framework path");
-        let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW) };
-        if handle.is_null() {
-            return Err(dl_error());
-        }
-
-        let create_list: Option<MTDeviceCreateList> =
-            unsafe { load_optional_symbol(handle, b"MTDeviceCreateList\0") };
-        let create_default: Option<MTDeviceCreateDefault> =
-            unsafe { load_optional_symbol(handle, b"MTDeviceCreateDefault\0") };
-        let register_callback: MTRegisterContactFrameCallback =
-            unsafe { load_symbol(handle, b"MTRegisterContactFrameCallback\0")? };
-        let device_start: MTDeviceStart = unsafe { load_symbol(handle, b"MTDeviceStart\0")? };
-
-        let mut devices = Vec::new();
-        let mut device_list = None;
-
-        if let Some(create_list) = create_list {
-            let list = unsafe { create_list() };
-            if !list.is_null() {
-                let device_count = unsafe { CFArrayGetCount(list) }.max(0);
-                for index in 0..device_count {
-                    let device = unsafe { CFArrayGetValueAtIndex(list, index) as MTDeviceRef };
-                    if !device.is_null() {
-                        devices.push(device);
-                    }
-                }
-                device_list = Some(list);
-            }
-        }
-
-        if devices.is_empty() {
-            let Some(create_default) = create_default else {
-                return Err("MTDeviceCreateList and MTDeviceCreateDefault unavailable".to_string());
-            };
-
-            let device = unsafe { create_default() };
-            if !device.is_null() {
-                devices.push(device);
-            }
-        }
-
-        if devices.is_empty() {
-            return Err("no MultitouchSupport devices available".to_string());
-        }
-
-        for &device in &devices {
-            unsafe {
-                register_callback(device, raw_trackpad_contact_callback);
-                device_start(device, 0);
-            }
-        }
-
-        Ok(Self {
-            _handle: handle,
-            _device_list: device_list,
-            _devices: devices,
-        })
-    }
-
-    fn device_count(&self) -> usize {
-        self._devices.len()
-    }
-}
-
-unsafe fn load_symbol<T: Copy>(handle: *mut libc::c_void, name: &[u8]) -> Result<T, String> {
-    let symbol = unsafe { libc::dlsym(handle, name.as_ptr().cast()) };
-    if symbol.is_null() {
-        return Err(format!(
-            "{} unavailable",
-            String::from_utf8_lossy(&name[..name.len().saturating_sub(1)])
-        ));
-    }
-
-    Ok(unsafe { std::mem::transmute_copy(&symbol) })
-}
-
-unsafe fn load_optional_symbol<T: Copy>(handle: *mut libc::c_void, name: &[u8]) -> Option<T> {
-    let symbol = unsafe { libc::dlsym(handle, name.as_ptr().cast()) };
-    if symbol.is_null() {
-        return None;
-    }
-
-    Some(unsafe { std::mem::transmute_copy(&symbol) })
-}
-
-fn dl_error() -> String {
-    let error = unsafe { libc::dlerror() };
-    if error.is_null() {
-        return "unknown dlopen error".to_string();
-    }
-
-    unsafe { std::ffi::CStr::from_ptr(error) }
-        .to_string_lossy()
-        .into_owned()
 }
 
 unsafe extern "C" fn raw_trackpad_contact_callback(
