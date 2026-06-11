@@ -1289,6 +1289,7 @@ fn install_status_item_event_tap_at_location(
         )
     }) else {
         let _ = unsafe { Box::from_raw(state_ptr) };
+        maybe_request_input_monitoring_for_event_tap(mode);
         log::warn!(
             "tray context menu: CoreGraphics {:?} event tap unavailable",
             location
@@ -1367,6 +1368,43 @@ fn event_tap_options_for_mode(mode: TrayEventTapMode) -> objc2_core_graphics::CG
         TrayEventTapMode::Active => objc2_core_graphics::CGEventTapOptions::Default,
         TrayEventTapMode::ListenOnly => objc2_core_graphics::CGEventTapOptions::ListenOnly,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn maybe_request_input_monitoring_for_event_tap(mode: TrayEventTapMode) {
+    if !should_request_input_monitoring_for_event_tap_failure(mode) {
+        return;
+    }
+
+    request_input_monitoring_access_once();
+}
+
+#[cfg(target_os = "macos")]
+fn should_request_input_monitoring_for_event_tap_failure(mode: TrayEventTapMode) -> bool {
+    mode == TrayEventTapMode::Active
+}
+
+#[cfg(target_os = "macos")]
+fn request_input_monitoring_access_once() {
+    static REQUEST_INPUT_MONITORING_ACCESS: std::sync::Once = std::sync::Once::new();
+
+    REQUEST_INPUT_MONITORING_ACCESS.call_once(|| {
+        if objc2_core_graphics::CGPreflightListenEventAccess() {
+            log::debug!("tray context menu: Input Monitoring already granted");
+            return;
+        }
+
+        log::warn!(
+            "tray context menu: requesting Input Monitoring permission for macOS context-click fallback"
+        );
+        if objc2_core_graphics::CGRequestListenEventAccess() {
+            log::warn!("tray context menu: Input Monitoring permission granted");
+        } else {
+            log::warn!(
+                "tray context menu: Input Monitoring still disabled; enable OpenUsage in System Settings > Privacy & Security > Input Monitoring, then relaunch"
+            );
+        }
+    });
 }
 
 #[cfg(target_os = "macos")]
@@ -2255,6 +2293,17 @@ mod tests {
             CGEventTapLocation::AnnotatedSessionEventTap,
             TrayEventTapMode::ListenOnly
         )));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn active_core_graphics_tap_failure_requests_input_monitoring() {
+        assert!(should_request_input_monitoring_for_event_tap_failure(
+            TrayEventTapMode::Active
+        ));
+        assert!(!should_request_input_monitoring_for_event_tap_failure(
+            TrayEventTapMode::ListenOnly
+        ));
     }
 
     #[cfg(target_os = "macos")]
