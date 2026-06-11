@@ -19,6 +19,8 @@ const LOG_LEVEL_STORE_KEY: &str = "logLevel";
 const STATUS_ITEM_HORIZONTAL_HIT_PADDING: f64 = 3.0;
 #[cfg(target_os = "macos")]
 const STATUS_ITEM_VERTICAL_HIT_PADDING: f64 = 12.0;
+#[cfg(target_os = "macos")]
+const STATUS_ITEM_TAHOE_MENU_BAR_HIT_HEIGHT: f64 = 30.0;
 
 fn should_open_tray_menu(button: MouseButton, button_state: MouseButtonState) -> bool {
     #[cfg(target_os = "macos")]
@@ -1146,6 +1148,8 @@ fn install_tray_input_overlay_window(
         log::warn!("tray context menu: status item frame unavailable for overlay window");
         return;
     };
+    let overlay_frame =
+        tray_input_overlay_window_frame(screen_frame, screen_top_y_for_status_frame(screen_frame));
 
     let overlay_view = unsafe {
         let view = mtm.alloc().set_ivars(TrayInputOverlayViewIvars {
@@ -1157,18 +1161,18 @@ fn install_tray_input_overlay_window(
         });
         let view: objc2::rc::Retained<TrayInputOverlayView> = msg_send![
             super(view),
-            initWithFrame: tray_input_overlay_content_frame(screen_frame)
+            initWithFrame: tray_input_overlay_content_frame(overlay_frame)
         ];
         view
     };
     let overlay_ns_view: &objc2_app_kit::NSView = overlay_view.as_super();
     accept_indirect_touch_events(overlay_ns_view);
-    overlay_ns_view.setFrame(tray_input_overlay_content_frame(screen_frame));
+    overlay_ns_view.setFrame(tray_input_overlay_content_frame(overlay_frame));
 
     let window = unsafe {
         let window = NSWindow::initWithContentRect_styleMask_backing_defer(
             mtm.alloc(),
-            screen_frame,
+            overlay_frame,
             NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
             NSBackingStoreType::Buffered,
             false,
@@ -1211,10 +1215,12 @@ fn sync_tray_input_overlay_window(
     let Some(screen_frame) = status_view_screen_frame(status_view) else {
         return;
     };
+    let overlay_frame =
+        tray_input_overlay_window_frame(screen_frame, screen_top_y_for_status_frame(screen_frame));
 
-    window.setFrame_display(screen_frame, false);
+    window.setFrame_display(overlay_frame, false);
     if let Some(content_view) = window.contentView() {
-        content_view.setFrame(tray_input_overlay_content_frame(screen_frame));
+        content_view.setFrame(tray_input_overlay_content_frame(overlay_frame));
     }
     if !window.isVisible() {
         window.orderFrontRegardless();
@@ -1222,10 +1228,56 @@ fn sync_tray_input_overlay_window(
 }
 
 #[cfg(target_os = "macos")]
-fn tray_input_overlay_content_frame(
-    screen_frame: objc2_foundation::NSRect,
+fn screen_top_y_for_status_frame(status_frame: objc2_foundation::NSRect) -> f64 {
+    let Some(mtm) = objc2_foundation::MainThreadMarker::new() else {
+        return status_frame.origin.y + status_frame.size.height;
+    };
+
+    objc2_app_kit::NSScreen::mainScreen(mtm)
+        .map(|screen| screen.frame().origin.y + screen.frame().size.height)
+        .filter(|screen_top_y| {
+            let status_top_y = status_frame.origin.y + status_frame.size.height;
+            (screen_top_y - status_top_y).abs() <= STATUS_ITEM_TAHOE_MENU_BAR_HIT_HEIGHT
+        })
+        .unwrap_or(status_frame.origin.y + status_frame.size.height)
+}
+
+#[cfg(target_os = "macos")]
+fn tray_input_overlay_window_frame(
+    status_frame: objc2_foundation::NSRect,
+    screen_top_y: f64,
 ) -> objc2_foundation::NSRect {
-    objc2_foundation::NSRect::new(objc2_foundation::NSPoint::new(0.0, 0.0), screen_frame.size)
+    let status_top_y = status_frame.origin.y + status_frame.size.height;
+    let top_y = if screen_top_y >= status_top_y
+        && screen_top_y - status_top_y <= STATUS_ITEM_TAHOE_MENU_BAR_HIT_HEIGHT
+    {
+        screen_top_y
+    } else {
+        status_top_y
+    };
+    let height = status_frame
+        .size
+        .height
+        .max(STATUS_ITEM_TAHOE_MENU_BAR_HIT_HEIGHT);
+    let bottom_y = top_y - height;
+
+    objc2_foundation::NSRect::new(
+        objc2_foundation::NSPoint::new(
+            status_frame.origin.x - STATUS_ITEM_HORIZONTAL_HIT_PADDING,
+            bottom_y,
+        ),
+        objc2_foundation::NSSize::new(
+            status_frame.size.width + (STATUS_ITEM_HORIZONTAL_HIT_PADDING * 2.0),
+            height,
+        ),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn tray_input_overlay_content_frame(
+    window_frame: objc2_foundation::NSRect,
+) -> objc2_foundation::NSRect {
+    objc2_foundation::NSRect::new(objc2_foundation::NSPoint::new(0.0, 0.0), window_frame.size)
 }
 
 #[cfg(target_os = "macos")]
@@ -2441,12 +2493,28 @@ mod tests {
         use objc2_foundation::{NSPoint, NSRect, NSSize};
 
         let status_frame = NSRect::new(NSPoint::new(100.0, 978.0), NSSize::new(24.0, 22.0));
-        let content_frame = tray_input_overlay_content_frame(status_frame);
+        let window_frame = tray_input_overlay_window_frame(status_frame, 1000.0);
+        let content_frame = tray_input_overlay_content_frame(window_frame);
 
         assert_eq!(content_frame.origin.x, 0.0);
         assert_eq!(content_frame.origin.y, 0.0);
-        assert_eq!(content_frame.size.width, status_frame.size.width);
-        assert_eq!(content_frame.size.height, status_frame.size.height);
+        assert_eq!(content_frame.size.width, window_frame.size.width);
+        assert_eq!(content_frame.size.height, window_frame.size.height);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tray_input_overlay_window_expands_to_tahoe_menu_bar_top_edge() {
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+        let status_frame = NSRect::new(NSPoint::new(100.0, 972.0), NSSize::new(24.0, 22.0));
+        let overlay_frame = tray_input_overlay_window_frame(status_frame, 1000.0);
+
+        assert_eq!(overlay_frame.origin.x, 97.0);
+        assert_eq!(overlay_frame.origin.y, 970.0);
+        assert_eq!(overlay_frame.size.width, 30.0);
+        assert_eq!(overlay_frame.size.height, 30.0);
+        assert_eq!(overlay_frame.origin.y + overlay_frame.size.height, 1000.0);
     }
 
     #[cfg(target_os = "macos")]
