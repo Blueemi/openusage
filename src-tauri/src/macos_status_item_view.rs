@@ -86,6 +86,41 @@ objc2::define_class!(
             }
         }
 
+        #[unsafe(method(scrollWheel:))]
+        fn scroll_wheel(&self, event: &NSEvent) {
+            self.handle_touch_event(event);
+        }
+
+        #[unsafe(method(magnifyWithEvent:))]
+        fn magnify_with_event(&self, event: &NSEvent) {
+            self.handle_touch_event(event);
+        }
+
+        #[unsafe(method(swipeWithEvent:))]
+        fn swipe_with_event(&self, event: &NSEvent) {
+            self.handle_touch_event(event);
+        }
+
+        #[unsafe(method(rotateWithEvent:))]
+        fn rotate_with_event(&self, event: &NSEvent) {
+            self.handle_touch_event(event);
+        }
+
+        #[unsafe(method(smartMagnifyWithEvent:))]
+        fn smart_magnify_with_event(&self, event: &NSEvent) {
+            self.handle_touch_event(event);
+        }
+
+        #[unsafe(method(pressureChangeWithEvent:))]
+        fn pressure_change_with_event(&self, event: &NSEvent) {
+            self.handle_touch_event(event);
+        }
+
+        #[unsafe(method(quickLookWithEvent:))]
+        fn quick_look_with_event(&self, event: &NSEvent) {
+            self.handle_touch_event(event);
+        }
+
         #[unsafe(method(touchesBeganWithEvent:))]
         fn touches_began_with_event(&self, event: &NSEvent) {
             self.handle_touch_event(event);

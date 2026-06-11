@@ -309,7 +309,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
     if let Err(error) = tray.with_inner_tray_icon(move |inner| {
         use muda::ContextMenu as _;
         use objc2::ClassType;
-        use objc2_app_kit::{NSEvent, NSEventMask, NSMenu, NSView};
+        use objc2_app_kit::{NSEvent, NSMenu, NSView};
         use objc2_foundation::MainThreadMarker;
         use std::cell::Cell;
         use std::ptr;
@@ -429,18 +429,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
             ptr::null_mut()
         });
         let block_ref: &block2::DynBlock<dyn Fn(NonNull<NSEvent>) -> *mut NSEvent> = &block;
-        let mask = NSEventMask::RightMouseDown
-            | NSEventMask::RightMouseUp
-            | NSEventMask::LeftMouseDown
-            | NSEventMask::LeftMouseUp
-            | NSEventMask::OtherMouseDown
-            | NSEventMask::OtherMouseUp
-            | NSEventMask::SystemDefined
-            | NSEventMask::Gesture
-            | NSEventMask::BeginGesture
-            | NSEventMask::EndGesture
-            | NSEventMask::Pressure
-            | NSEventMask::DirectTouch;
+        let mask = status_item_native_event_monitor_mask();
         let token =
             unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, block_ref) };
         if let Some(token) = token {
@@ -450,11 +439,28 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         }
 
         let last_global_event_number = Cell::new(-1);
+        let global_two_touch_menu_open = Cell::new(false);
         let global_block = block2::RcBlock::new(move |event_ptr: NonNull<NSEvent>| {
             let event = unsafe { event_ptr.as_ref() };
-            if !should_open_tray_menu_from_native_event(event)
-                || !is_mouse_inside_status_view(&global_status_view)
+            if !is_mouse_inside_status_view(&global_status_view) {
+                return;
+            }
+
+            let touch_count = active_touch_count_for_event(event, &global_status_view);
+            if should_open_tray_menu_from_touch_count(global_two_touch_menu_open.get(), touch_count)
             {
+                global_two_touch_menu_open.set(true);
+                log::debug!(
+                    "tray context menu: opening from global two-touch event touch_count={touch_count}"
+                );
+                show_native_tray_menu_at_view(&global_ns_menu, &global_status_view);
+                return;
+            }
+            if should_reset_touch_menu_gate(touch_count) {
+                global_two_touch_menu_open.set(false);
+            }
+
+            if !should_open_tray_menu_from_native_event(event) {
                 return;
             }
 
@@ -1092,6 +1098,29 @@ fn accept_indirect_touch_events(view: &objc2_app_kit::NSView) {
     view.setAcceptsTouchEvents(true);
     view.setWantsRestingTouches(true);
     view.setAllowedTouchTypes(objc2_app_kit::NSTouchTypeMask::Indirect);
+}
+
+#[cfg(target_os = "macos")]
+fn status_item_native_event_monitor_mask() -> objc2_app_kit::NSEventMask {
+    use objc2_app_kit::NSEventMask;
+
+    NSEventMask::RightMouseDown
+        | NSEventMask::RightMouseUp
+        | NSEventMask::LeftMouseDown
+        | NSEventMask::LeftMouseUp
+        | NSEventMask::OtherMouseDown
+        | NSEventMask::OtherMouseUp
+        | NSEventMask::SystemDefined
+        | NSEventMask::ScrollWheel
+        | NSEventMask::Gesture
+        | NSEventMask::Magnify
+        | NSEventMask::Swipe
+        | NSEventMask::Rotate
+        | NSEventMask::BeginGesture
+        | NSEventMask::EndGesture
+        | NSEventMask::SmartMagnify
+        | NSEventMask::Pressure
+        | NSEventMask::DirectTouch
 }
 
 #[cfg(target_os = "macos")]
@@ -1971,6 +2000,23 @@ mod tests {
         assert!(mask.contains(NSEventMask::OtherMouseUp));
         assert!(mask.contains(NSEventMask::LeftMouseDown));
         assert!(mask.contains(NSEventMask::LeftMouseUp));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_event_monitor_mask_includes_trackpad_gesture_events() {
+        use objc2_app_kit::NSEventMask;
+
+        let mask = status_item_native_event_monitor_mask();
+
+        assert!(mask.contains(NSEventMask::ScrollWheel));
+        assert!(mask.contains(NSEventMask::Gesture));
+        assert!(mask.contains(NSEventMask::Magnify));
+        assert!(mask.contains(NSEventMask::Swipe));
+        assert!(mask.contains(NSEventMask::Rotate));
+        assert!(mask.contains(NSEventMask::SmartMagnify));
+        assert!(mask.contains(NSEventMask::Pressure));
+        assert!(mask.contains(NSEventMask::DirectTouch));
     }
 
     #[cfg(target_os = "macos")]
