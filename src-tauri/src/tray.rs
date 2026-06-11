@@ -338,18 +338,32 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
             }
         };
         let ns_menu = unsafe { &*(menu.ns_menu().cast::<NSMenu>()) };
-        status_item.setMenu(Some(ns_menu));
         let local_ns_menu = ns_menu.retain();
         let local_status_item = status_item.retain();
         let button_view: &NSView = button.as_super().as_super().as_super();
-        let local_status_view = button_view.retain();
-        set_context_menu_on_view_tree(button_view, ns_menu);
-        update_native_tray_rect_from_view(button_view);
-        install_status_button_action_target(ns_menu, &status_item, &button);
-        install_status_view_context_click_gestures(ns_menu, &status_item, button_view);
-        install_tray_input_view(&app_handle, ns_menu, &status_item, button_view);
+        let custom_status_view = crate::macos_status_item_view::install(
+            &app_handle,
+            ns_menu,
+            &status_item,
+            button.image().as_deref(),
+            button_view.bounds().size,
+        );
+        let installed_custom_status_view = custom_status_view.is_some();
+        let status_view = custom_status_view.unwrap_or_else(|| {
+            status_item.setMenu(Some(ns_menu));
+            button_view.retain()
+        });
+        let status_view: &NSView = &status_view;
+        let local_status_view = status_view.retain();
+        set_context_menu_on_view_tree(status_view, ns_menu);
+        update_native_tray_rect_from_view(status_view);
+        if !installed_custom_status_view {
+            install_status_button_action_target(ns_menu, &status_item, &button);
+            install_status_view_context_click_gestures(ns_menu, &status_item, status_view);
+            install_tray_input_view(&app_handle, ns_menu, &status_item, status_view);
+        }
 
-        let Some(window) = button.window() else {
+        let Some(window) = status_view.window() else {
             log::warn!("tray context menu: status item window unavailable");
             std::mem::forget(menu);
             return;
@@ -358,10 +372,10 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         let status_window_number = window.windowNumber();
         let global_ns_menu = ns_menu.retain();
         let global_status_item = status_item.retain();
-        let global_status_view = button_view.retain();
-        install_status_item_event_tap(ns_menu, &status_item, button_view);
-        install_secondary_click_poll_timer(ns_menu, &status_item, button_view);
-        crate::macos_trackpad::install_context_click_fallback(ns_menu, &status_item, button_view);
+        let global_status_view = status_view.retain();
+        install_status_item_event_tap(ns_menu, &status_item, status_view);
+        install_secondary_click_poll_timer(ns_menu, &status_item, status_view);
+        crate::macos_trackpad::install_context_click_fallback(ns_menu, &status_item, status_view);
         log::debug!("tray context menu: installed on status button view tree");
 
         let last_event_number = Cell::new(-1);
@@ -796,7 +810,7 @@ fn primary_status_item_click_action_details(
 }
 
 #[cfg(target_os = "macos")]
-fn update_native_tray_rect_from_view(view: &objc2_app_kit::NSView) {
+pub(crate) fn update_native_tray_rect_from_view(view: &objc2_app_kit::NSView) {
     let Some(screen_frame) = status_view_screen_frame(view) else {
         return;
     };
@@ -1483,6 +1497,35 @@ pub(crate) fn show_native_tray_menu(
     }
 
     show_native_tray_menu_without_recent_guard(status_item, menu);
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn show_native_tray_menu_at_view(
+    menu: &objc2_app_kit::NSMenu,
+    view: &objc2_app_kit::NSView,
+) {
+    if should_skip_recent_native_menu_open(std::time::Instant::now()) {
+        return;
+    }
+
+    log::debug!("tray context menu: showing native menu at status view");
+    update_native_tray_rect_from_view(view);
+    pop_up_native_tray_menu_at_view(menu, view);
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn show_native_tray_menu_for_event(
+    menu: &objc2_app_kit::NSMenu,
+    event: &objc2_app_kit::NSEvent,
+    view: &objc2_app_kit::NSView,
+) {
+    if should_skip_recent_native_menu_open(std::time::Instant::now()) {
+        return;
+    }
+
+    log::debug!("tray context menu: showing native context menu for event");
+    update_native_tray_rect_from_view(view);
+    objc2_app_kit::NSMenu::popUpContextMenu_withEvent_forView(menu, event, view);
 }
 
 #[cfg(target_os = "macos")]

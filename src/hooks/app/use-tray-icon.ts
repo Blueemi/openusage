@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react"
+import { invoke } from "@tauri-apps/api/core"
+import type { Image } from "@tauri-apps/api/image"
 import { resolveResource } from "@tauri-apps/api/path"
 import { TrayIcon } from "@tauri-apps/api/tray"
 import type { PluginMeta } from "@/lib/plugin-types"
@@ -32,6 +34,45 @@ const EMPTY_TRAY_SETTINGS_PREVIEW: TraySettingsPreview = {
   bars: [],
   providerBars: [],
   providerPercentText: "--%",
+}
+
+type TrayIconSource = string | Image
+
+async function trySetCustomMacosTrayIcon(icon: TrayIconSource, isTemplate: boolean): Promise<boolean> {
+  try {
+    if (typeof icon === "string") {
+      return await invoke<boolean>("set_macos_status_item_icon", {
+        path: icon,
+        isTemplate,
+      })
+    }
+
+    const maybeImage = icon as Partial<Image>
+    if (typeof maybeImage.rgba !== "function" || typeof maybeImage.size !== "function") {
+      return false
+    }
+
+    const [rgba, size] = await Promise.all([maybeImage.rgba(), maybeImage.size()])
+    return await invoke<boolean>("set_macos_status_item_icon", {
+      rgba: Array.from(rgba),
+      width: size.width,
+      height: size.height,
+      isTemplate,
+    })
+  } catch (e) {
+    console.error("Failed to update custom macOS tray icon:", e)
+    return false
+  }
+}
+
+async function setTrayIconImage(tray: TrayIcon, icon: TrayIconSource, isTemplate: boolean): Promise<boolean> {
+  if (await trySetCustomMacosTrayIcon(icon, isTemplate)) {
+    return true
+  }
+
+  await tray.setIcon(icon)
+  await tray.setIconAsTemplate(isTemplate)
+  return false
 }
 
 function isSameTraySettingsPreview(a: TraySettingsPreview, b: TraySettingsPreview): boolean {
@@ -160,12 +201,12 @@ export function useTrayIcon({
       const restoreGaugeIcon = () => {
         const gaugePath = trayGaugeIconPathRef.current
         if (gaugePath) {
-          Promise.all([
-            tray.setIcon(gaugePath),
-            tray.setIconAsTemplate(true),
-            setTrayTitle(""),
-            setTrayTooltip("OpenUsage"),
-          ])
+          setTrayIconImage(tray, gaugePath, true)
+            .then(async (customIconHandled) => {
+              if (customIconHandled) return
+              await setTrayTitle("")
+              await setTrayTooltip("OpenUsage")
+            })
             .catch((e) => {
               console.error("Failed to restore tray gauge icon:", e)
             })
@@ -264,8 +305,8 @@ export function useTrayIcon({
           style: "bars",
         })
           .then(async (img) => {
-            await tray.setIcon(img)
-            await tray.setIconAsTemplate(true)
+            const customIconHandled = await setTrayIconImage(tray, img, true)
+            if (customIconHandled) return
             await setTrayTitle("")
             await updateTooltip()
           })
@@ -292,8 +333,8 @@ export function useTrayIcon({
           providerIconUrl,
         })
           .then(async (img) => {
-            await tray.setIcon(img)
-            await tray.setIconAsTemplate(true)
+            const customIconHandled = await setTrayIconImage(tray, img, true)
+            if (customIconHandled) return
             await setTrayTitle("")
             await updateTooltip()
           })
@@ -314,8 +355,8 @@ export function useTrayIcon({
         providerIconUrl,
       })
         .then(async (img) => {
-          await tray.setIcon(img)
-          await tray.setIconAsTemplate(true)
+          const customIconHandled = await setTrayIconImage(tray, img, true)
+          if (customIconHandled) return
           await setTrayTitle(providerPercentText)
           await updateTooltip()
         })

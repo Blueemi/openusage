@@ -4,6 +4,10 @@ mod config;
 mod local_http_api;
 mod log_path;
 #[cfg(target_os = "macos")]
+mod macos_status_item_icon;
+#[cfg(target_os = "macos")]
+mod macos_status_item_view;
+#[cfg(target_os = "macos")]
 mod macos_trackpad;
 mod panel;
 mod plugin_engine;
@@ -389,6 +393,43 @@ fn get_log_path(app_handle: tauri::AppHandle) -> Result<String, String> {
     log_path::for_app(&app_handle).map(|path| path.to_string_lossy().to_string())
 }
 
+#[tauri::command]
+fn set_macos_status_item_icon(
+    #[allow(unused)] app_handle: tauri::AppHandle,
+    #[allow(unused)] path: Option<String>,
+    #[allow(unused)] rgba: Option<Vec<u8>>,
+    #[allow(unused)] width: Option<u32>,
+    #[allow(unused)] height: Option<u32>,
+    #[allow(unused)] is_template: bool,
+) -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let image = if let Some(path) = path {
+            let image = tauri::image::Image::from_path(path)
+                .map_err(|error| format!("failed to load tray icon image: {error}"))?;
+            (image.rgba().to_vec(), image.width(), image.height())
+        } else {
+            let rgba = rgba.ok_or_else(|| "missing tray icon rgba".to_string())?;
+            let width = width.ok_or_else(|| "missing tray icon width".to_string())?;
+            let height = height.ok_or_else(|| "missing tray icon height".to_string())?;
+            (rgba, width, height)
+        };
+
+        crate::macos_status_item_icon::set_icon_rgba(
+            &app_handle,
+            image.0,
+            image.1,
+            image.2,
+            is_template,
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(false)
+    }
+}
+
 /// Update the global shortcut registration.
 /// Pass `null` to disable the shortcut, or a shortcut string like "CommandOrControl+Shift+U".
 #[cfg(desktop)]
@@ -541,6 +582,7 @@ pub fn run() {
             start_probe_batch,
             list_plugins,
             get_log_path,
+            set_macos_status_item_icon,
             update_global_shortcut
         ])
         .setup(|app| {

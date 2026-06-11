@@ -43,6 +43,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 regex-lite = "0.1.9"
 aes-gcm = "0.10.3"
 sha2 = "0.11"
+png = "0.17"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
@@ -50,8 +51,8 @@ muda = { version = "0.19", default-features = false }
 objc2 = "0.6"
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFMachPort", "CFRunLoop"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGEvent", "CGEventSource", "CGEventTypes"] }
-objc2-foundation = { version = "0.3", features = ["NSDate", "NSProcessInfo", "NSRunLoop", "NSString", "NSTimer", "block2"] }
-objc2-app-kit = { version = "0.3", features = ["block2", "NSApplication", "NSButton", "NSClickGestureRecognizer", "NSColor", "NSControl", "NSEvent", "NSGestureRecognizer", "NSGraphics", "NSMenu", "NSMenuItem", "NSResponder", "NSScreen", "NSStatusBarButton", "NSStatusItem", "NSTouch", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3", features = ["NSData", "NSDate", "NSProcessInfo", "NSRunLoop", "NSString", "NSTimer", "block2"] }
+objc2-app-kit = { version = "0.3", features = ["block2", "NSApplication", "NSButton", "NSCell", "NSClickGestureRecognizer", "NSColor", "NSControl", "NSEvent", "NSGestureRecognizer", "NSGraphics", "NSImage", "NSImageView", "NSMenu", "NSMenuItem", "NSResponder", "NSScreen", "NSStatusBarButton", "NSStatusItem", "NSTouch", "NSView", "NSWindow"] }
 objc2-web-kit = { version = "0.3", features = ["WKPreferences", "WKWebView", "WKWebViewConfiguration"] }
 
 [dev-dependencies]

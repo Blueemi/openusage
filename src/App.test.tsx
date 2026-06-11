@@ -473,6 +473,43 @@ describe("App", () => {
     await waitFor(() => expect(state.traySetIconMock).toHaveBeenCalled())
   })
 
+  it("skips Tauri tray setIcon when custom macOS status item handles the icon", async () => {
+    const renderedIcon = {
+      rgba: vi.fn(async () => new Uint8Array([0, 0, 0, 0])),
+      size: vi.fn(async () => ({ width: 1, height: 1 })),
+    }
+    state.renderTrayBarsIconMock.mockResolvedValue(renderedIcon)
+    state.invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "set_macos_status_item_icon") return true
+      if (cmd === "list_plugins") {
+        return [
+          {
+            id: "a",
+            name: "Alpha",
+            iconUrl: "icon-a",
+            primaryCandidates: ["Session"],
+            lines: [{ type: "progress", label: "Session", scope: "overview" }],
+          },
+        ]
+      }
+      return null
+    })
+    state.loadPluginSettingsMock.mockResolvedValueOnce({ order: ["a"], disabled: [] })
+
+    render(<App />)
+    await waitFor(() => expect(state.startBatchMock).toHaveBeenCalled())
+    await waitFor(() =>
+      expect(state.invokeMock).toHaveBeenCalledWith("set_macos_status_item_icon", {
+        rgba: [0, 0, 0, 0],
+        width: 1,
+        height: 1,
+        isTemplate: true,
+      })
+    )
+
+    expect(state.traySetIconMock).not.toHaveBeenCalledWith(renderedIcon)
+  })
+
   it("renders first provider tray icon on launch before probe data", async () => {
     state.invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "list_plugins") {
