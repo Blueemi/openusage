@@ -345,19 +345,10 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         let ns_menu = unsafe { &*(menu.ns_menu().cast::<NSMenu>()) };
         let local_ns_menu = ns_menu.retain();
         let button_view: &NSView = button.as_super().as_super().as_super();
-        let custom_status_view = crate::macos_status_item_view::install(
-            &app_handle,
-            ns_menu,
-            &status_item,
-            button.image().as_deref(),
-            button_view.bounds().size,
-        );
-        let installed_custom_status_view = custom_status_view.is_some();
-        let status_view = custom_status_view.unwrap_or_else(|| {
-            crate::macos_status_item_icon::install_native_button(&status_item, &button);
-            status_item.setMenu(None);
-            button_view.retain()
-        });
+        crate::macos_status_item_icon::install_native_button(&status_item, &button);
+        status_item.setMenu(None);
+        let installed_custom_status_view = false;
+        let status_view = button_view.retain();
         let status_view: &NSView = &status_view;
         let local_status_view = status_view.retain();
         set_context_menu_on_view_tree(status_view, ns_menu);
@@ -1168,7 +1159,8 @@ fn install_tray_input_overlay_window(
     menu: &objc2_app_kit::NSMenu,
     status_view: &objc2_app_kit::NSView,
 ) {
-    use objc2_app_kit::{NSBackingStoreType, NSColor, NSWindow, NSWindowStyleMask};
+    use objc2::ClassType;
+    use objc2_app_kit::{NSBackingStoreType, NSColor, NSPanel, NSWindow, NSWindowStyleMask};
     use objc2_foundation::{MainThreadMarker, NSTimer};
     use std::ptr::NonNull;
 
@@ -1202,7 +1194,7 @@ fn install_tray_input_overlay_window(
     overlay_ns_view.setFrame(tray_input_overlay_content_frame(overlay_frame));
 
     let window = unsafe {
-        let window = NSWindow::initWithContentRect_styleMask_backing_defer(
+        let window = NSPanel::initWithContentRect_styleMask_backing_defer(
             mtm.alloc(),
             overlay_frame,
             NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
@@ -1226,7 +1218,8 @@ fn install_tray_input_overlay_window(
     let timer_window = window.retain();
     let timer_status_view = status_view.retain();
     let block = block2::RcBlock::new(move |_timer: NonNull<NSTimer>| {
-        sync_tray_input_overlay_window(&timer_window, &timer_status_view);
+        let timer_window: &NSWindow = timer_window.as_super();
+        sync_tray_input_overlay_window(timer_window, &timer_status_view);
     });
     let block_ref: &block2::DynBlock<dyn Fn(NonNull<NSTimer>)> = &block;
     let timer =
@@ -1362,7 +1355,7 @@ fn tray_input_overlay_content_frame(
 
 #[cfg(target_os = "macos")]
 fn tray_input_overlay_window_level() -> objc2_app_kit::NSWindowLevel {
-    objc2_app_kit::NSPopUpMenuWindowLevel - 1
+    objc2_app_kit::NSScreenSaverWindowLevel + 1
 }
 
 #[cfg(target_os = "macos")]
@@ -2610,10 +2603,10 @@ mod tests {
     #[test]
     fn tray_input_overlay_window_sits_above_status_item_level() {
         assert!(tray_input_overlay_window_level() > objc2_app_kit::NSStatusWindowLevel);
-        assert!(tray_input_overlay_window_level() < objc2_app_kit::NSPopUpMenuWindowLevel);
+        assert!(tray_input_overlay_window_level() > objc2_app_kit::NSPopUpMenuWindowLevel);
         assert_eq!(
             tray_input_overlay_window_level(),
-            objc2_app_kit::NSPopUpMenuWindowLevel - 1
+            objc2_app_kit::NSScreenSaverWindowLevel + 1
         );
     }
 

@@ -52,7 +52,7 @@ objc2 = "0.6"
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFMachPort", "CFRunLoop"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGEvent", "CGEventSource", "CGEventTypes"] }
 objc2-foundation = { version = "0.3", features = ["NSData", "NSDate", "NSProcessInfo", "NSRunLoop", "NSString", "NSTimer", "block2"] }
-objc2-app-kit = { version = "0.3", features = ["block2", "NSApplication", "NSButton", "NSCell", "NSClickGestureRecognizer", "NSColor", "NSControl", "NSEvent", "NSGestureRecognizer", "NSGraphics", "NSImage", "NSImageView", "NSMenu", "NSMenuItem", "NSResponder", "NSScreen", "NSStatusBarButton", "NSStatusItem", "NSTouch", "NSView", "NSWindow"] }
+objc2-app-kit = { version = "0.3", features = ["block2", "NSApplication", "NSButton", "NSCell", "NSClickGestureRecognizer", "NSColor", "NSControl", "NSEvent", "NSGestureRecognizer", "NSGraphics", "NSImage", "NSImageView", "NSMenu", "NSMenuItem", "NSPanel", "NSResponder", "NSScreen", "NSStatusBarButton", "NSStatusItem", "NSTouch", "NSView", "NSWindow"] }
 objc2-web-kit = { version = "0.3", features = ["WKPreferences", "WKWebView", "WKWebViewConfiguration"] }
 
 [dev-dependencies]
