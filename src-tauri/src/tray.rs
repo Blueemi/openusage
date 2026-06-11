@@ -365,6 +365,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         log::debug!("tray context menu: installed on status button view tree");
 
         let last_event_number = Cell::new(-1);
+        let local_two_touch_menu_open = Cell::new(false);
         let local_app_handle = app_handle.clone();
         let block = block2::RcBlock::new(move |event_ptr: NonNull<NSEvent>| -> *mut NSEvent {
             let event = unsafe { event_ptr.as_ref() };
@@ -372,10 +373,31 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
                 return event_ptr.as_ptr();
             }
 
+            let touch_count = active_touch_count_for_event(event, &local_status_view);
+            if should_open_tray_menu_from_touch_count(local_two_touch_menu_open.get(), touch_count)
+            {
+                local_two_touch_menu_open.set(true);
+                log::debug!(
+                    "tray context menu: opening from two-touch status item event touch_count={touch_count}"
+                );
+                show_native_tray_menu(&local_status_item, &local_ns_menu);
+                return ptr::null_mut();
+            }
+            if should_reset_touch_menu_gate(touch_count) {
+                local_two_touch_menu_open.set(false);
+            }
+
             if should_handle_primary_status_item_click(event) {
-                if event.r#type() == objc2_app_kit::NSEventType::LeftMouseUp {
-                    update_native_tray_rect_from_view(&local_status_view);
-                    toggle_panel(&local_app_handle);
+                match primary_status_item_click_action(
+                    event,
+                    native_menu_recently_opened_for_mouse_up(std::time::Instant::now()),
+                ) {
+                    PrimaryStatusItemClickAction::TogglePanel => {
+                        update_native_tray_rect_from_view(&local_status_view);
+                        toggle_panel(&local_app_handle);
+                    }
+                    PrimaryStatusItemClickAction::Ignore => {}
+                    PrimaryStatusItemClickAction::PassThrough => return event_ptr.as_ptr(),
                 }
                 return ptr::null_mut();
             }
@@ -726,6 +748,51 @@ fn should_handle_primary_status_item_click_details(
     (event_type == NSEventType::LeftMouseDown || event_type == NSEventType::LeftMouseUp)
         && button_number == 0
         && !modifier_flags.contains(NSEventModifierFlags::Control)
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimaryStatusItemClickAction {
+    Ignore,
+    TogglePanel,
+    PassThrough,
+}
+
+#[cfg(target_os = "macos")]
+fn primary_status_item_click_action(
+    event: &objc2_app_kit::NSEvent,
+    native_menu_recently_opened: bool,
+) -> PrimaryStatusItemClickAction {
+    primary_status_item_click_action_details(
+        event.r#type(),
+        event.modifierFlags(),
+        event.buttonNumber(),
+        native_menu_recently_opened,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn primary_status_item_click_action_details(
+    event_type: objc2_app_kit::NSEventType,
+    modifier_flags: objc2_app_kit::NSEventModifierFlags,
+    button_number: isize,
+    native_menu_recently_opened: bool,
+) -> PrimaryStatusItemClickAction {
+    use objc2_app_kit::NSEventType;
+
+    if !should_handle_primary_status_item_click_details(event_type, modifier_flags, button_number) {
+        return PrimaryStatusItemClickAction::PassThrough;
+    }
+
+    if native_menu_recently_opened {
+        return PrimaryStatusItemClickAction::Ignore;
+    }
+
+    if event_type == NSEventType::LeftMouseUp {
+        return PrimaryStatusItemClickAction::TogglePanel;
+    }
+
+    PrimaryStatusItemClickAction::Ignore
 }
 
 #[cfg(target_os = "macos")]
@@ -1855,6 +1922,62 @@ mod tests {
             NSEventType::LeftMouseDown,
             NSEventModifierFlags::empty(),
             1
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn primary_status_item_click_action_suppresses_mouse_up_after_menu() {
+        use objc2_app_kit::{NSEventModifierFlags, NSEventType};
+
+        assert_eq!(
+            primary_status_item_click_action_details(
+                NSEventType::LeftMouseDown,
+                NSEventModifierFlags::empty(),
+                0,
+                false
+            ),
+            PrimaryStatusItemClickAction::Ignore
+        );
+        assert_eq!(
+            primary_status_item_click_action_details(
+                NSEventType::LeftMouseUp,
+                NSEventModifierFlags::empty(),
+                0,
+                false
+            ),
+            PrimaryStatusItemClickAction::TogglePanel
+        );
+        assert_eq!(
+            primary_status_item_click_action_details(
+                NSEventType::LeftMouseUp,
+                NSEventModifierFlags::empty(),
+                0,
+                true
+            ),
+            PrimaryStatusItemClickAction::Ignore
+        );
+        assert_eq!(
+            primary_status_item_click_action_details(
+                NSEventType::LeftMouseDown,
+                NSEventModifierFlags::Control,
+                0,
+                false
+            ),
+            PrimaryStatusItemClickAction::PassThrough
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn local_monitor_checks_two_touch_before_primary_click() {
+        use objc2_app_kit::{NSEventModifierFlags, NSEventType};
+
+        assert!(should_open_tray_menu_from_touch_count(false, 2));
+        assert!(should_handle_primary_status_item_click_details(
+            NSEventType::LeftMouseDown,
+            NSEventModifierFlags::empty(),
+            0
         ));
     }
 

@@ -56,6 +56,7 @@ struct RawTrackpadMenuTimerState {
     touch_state: Arc<RawTrackpadTouchState>,
     two_finger_was_active: std::cell::Cell<bool>,
     two_finger_sequence_inside_status_view: std::cell::Cell<bool>,
+    menu_opened_for_sequence: std::cell::Cell<bool>,
 }
 
 struct MultitouchSupportRuntime {
@@ -120,6 +121,7 @@ fn install_raw_trackpad_menu_timer(
         touch_state,
         two_finger_was_active: std::cell::Cell::new(false),
         two_finger_sequence_inside_status_view: std::cell::Cell::new(false),
+        menu_opened_for_sequence: std::cell::Cell::new(false),
     });
     let block_state = state.clone();
     let block = block2::RcBlock::new(move |_timer: NonNull<NSTimer>| {
@@ -136,14 +138,29 @@ fn install_raw_trackpad_menu_timer(
             .two_finger_sequence_inside_status_view
             .set(sequence_inside_status_view);
 
+        if should_open_raw_trackpad_menu_while_sequence_active(
+            two_finger_is_active,
+            cursor_inside_status_view,
+            block_state.menu_opened_for_sequence.get(),
+        ) {
+            block_state.menu_opened_for_sequence.set(true);
+            log::debug!(
+                "tray context menu: raw trackpad two-finger sequence active inside status view"
+            );
+            crate::tray::show_native_tray_menu(&block_state.status_item, &block_state.menu);
+            return;
+        }
+
         if should_open_raw_trackpad_menu_on_sequence_end(
             two_finger_was_active,
             two_finger_is_active,
             sequence_inside_status_view,
+            block_state.menu_opened_for_sequence.get(),
         ) {
             block_state
                 .two_finger_sequence_inside_status_view
                 .set(false);
+            block_state.menu_opened_for_sequence.set(false);
             log::debug!(
                 "tray context menu: raw trackpad two-finger sequence ended active_fingers={active_fingers}"
             );
@@ -152,6 +169,7 @@ fn install_raw_trackpad_menu_timer(
             block_state
                 .two_finger_sequence_inside_status_view
                 .set(false);
+            block_state.menu_opened_for_sequence.set(false);
         }
     });
     let block_ref: &block2::DynBlock<dyn Fn(NonNull<NSTimer>)> = &block;
@@ -323,8 +341,20 @@ fn should_open_raw_trackpad_menu_on_sequence_end(
     two_finger_was_active: bool,
     two_finger_is_active: bool,
     two_finger_sequence_inside_status_view: bool,
+    menu_opened_for_sequence: bool,
 ) -> bool {
-    two_finger_was_active && !two_finger_is_active && two_finger_sequence_inside_status_view
+    two_finger_was_active
+        && !two_finger_is_active
+        && two_finger_sequence_inside_status_view
+        && !menu_opened_for_sequence
+}
+
+fn should_open_raw_trackpad_menu_while_sequence_active(
+    two_finger_is_active: bool,
+    cursor_inside_status_view: bool,
+    menu_opened_for_sequence: bool,
+) -> bool {
+    two_finger_is_active && cursor_inside_status_view && !menu_opened_for_sequence
 }
 
 #[cfg(test)]
@@ -333,18 +363,19 @@ mod tests {
 
     #[test]
     fn raw_trackpad_menu_opens_when_two_finger_sequence_ends_inside_status_view() {
-        assert!(should_open_raw_trackpad_menu_on_sequence_end(
-            true, false, true
-        ));
-        assert!(!should_open_raw_trackpad_menu_on_sequence_end(
-            false, true, true
-        ));
-        assert!(!should_open_raw_trackpad_menu_on_sequence_end(
-            true, true, true
-        ));
-        assert!(!should_open_raw_trackpad_menu_on_sequence_end(
-            true, false, false
-        ));
+        assert!(should_open_raw_trackpad_menu_on_sequence_end(true, false, true, false));
+        assert!(!should_open_raw_trackpad_menu_on_sequence_end(false, true, true, false));
+        assert!(!should_open_raw_trackpad_menu_on_sequence_end(true, true, true, false));
+        assert!(!should_open_raw_trackpad_menu_on_sequence_end(true, false, false, false));
+        assert!(!should_open_raw_trackpad_menu_on_sequence_end(true, false, true, true));
+    }
+
+    #[test]
+    fn raw_trackpad_menu_opens_while_two_fingers_are_active_inside_status_view() {
+        assert!(should_open_raw_trackpad_menu_while_sequence_active(true, true, false));
+        assert!(!should_open_raw_trackpad_menu_while_sequence_active(true, true, true));
+        assert!(!should_open_raw_trackpad_menu_while_sequence_active(true, false, false));
+        assert!(!should_open_raw_trackpad_menu_while_sequence_active(false, true, false));
     }
 
     #[test]
