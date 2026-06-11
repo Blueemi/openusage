@@ -368,6 +368,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         let global_status_view = status_view.retain();
         install_status_item_event_tap(ns_menu, status_view);
         install_secondary_click_poll_timer(ns_menu, status_view);
+        crate::macos_hid_secondary_click::install(ns_menu, status_view);
         crate::macos_trackpad::install_context_click_fallback(ns_menu, status_view);
         log::debug!("tray context menu: installed on status button view tree");
 

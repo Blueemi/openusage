@@ -4,6 +4,8 @@ mod config;
 mod local_http_api;
 mod log_path;
 #[cfg(target_os = "macos")]
+mod macos_hid_secondary_click;
+#[cfg(target_os = "macos")]
 mod macos_multitouch_support;
 #[cfg(target_os = "macos")]
 mod macos_status_item_icon;
