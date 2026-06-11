@@ -60,3 +60,12 @@ fn raw_trackpad_callback_logs_first_frame_and_finger_changes() {
     assert!(should_log_raw_callback_frame(2, 1, 2));
     assert!(!should_log_raw_callback_frame(2, 2, 2));
 }
+
+#[test]
+fn raw_trackpad_callback_returns_success_for_multitouch_runtime() {
+    let status = unsafe {
+        raw_trackpad_contact_callback(std::ptr::null_mut(), std::ptr::null_mut(), 0, 0.0, 0)
+    };
+
+    assert_eq!(status, 0);
+}

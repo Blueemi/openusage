@@ -160,7 +160,7 @@ unsafe extern "C" fn raw_trackpad_contact_callback(
     active_fingers: usize,
     _timestamp: libc::c_double,
     _frame: usize,
-) {
+) -> libc::c_int {
     if let Some(state) = RAW_TRACKPAD_TOUCH_STATE.get() {
         let active_fingers = normalize_raw_active_fingers(active_fingers);
         let now_millis = raw_trackpad_elapsed_millis();
@@ -182,6 +182,8 @@ unsafe extern "C" fn raw_trackpad_contact_callback(
             }
         }
     }
+
+    0
 }
 
 fn normalize_raw_active_fingers(active_fingers: usize) -> usize {

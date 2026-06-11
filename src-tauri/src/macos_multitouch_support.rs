@@ -6,8 +6,13 @@ type CFIndex = isize;
 type CFRunLoopRef = *const libc::c_void;
 type CFRunLoopSourceRef = *const libc::c_void;
 type CFStringRef = *const libc::c_void;
-pub(crate) type MTContactCallback =
-    unsafe extern "C" fn(MTDeviceRef, *mut libc::c_void, usize, libc::c_double, usize);
+pub(crate) type MTContactCallback = unsafe extern "C" fn(
+    MTDeviceRef,
+    *mut libc::c_void,
+    usize,
+    libc::c_double,
+    usize,
+) -> libc::c_int;
 type MTDeviceCreateDefault = unsafe extern "C" fn() -> MTDeviceRef;
 type MTDeviceCreateList = unsafe extern "C" fn() -> CFArrayRef;
 type MTDeviceCreateMultitouchRunLoopSource =
