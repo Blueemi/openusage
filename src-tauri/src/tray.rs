@@ -11,7 +11,13 @@ use crate::log_path;
 use crate::panel::{get_or_init_panel, position_panel_at_tray_icon, show_panel, toggle_panel};
 
 #[cfg(target_os = "macos")]
+use objc2::MainThreadOnly;
+#[cfg(target_os = "macos")]
 use objc2::{AnyThread as _, ClassType as _, DeclaredClass as _, Message as _, msg_send};
+#[cfg(target_os = "macos")]
+use objc2_app_kit::NSMenuDelegate;
+#[cfg(target_os = "macos")]
+use objc2_foundation::NSObjectProtocol;
 
 const LOG_LEVEL_STORE_KEY: &str = "logLevel";
 
@@ -346,13 +352,13 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         let local_ns_menu = ns_menu.retain();
         let button_view: &NSView = button.as_super().as_super().as_super();
         crate::macos_status_item_icon::install_native_button(&status_item, &button);
-        status_item.setMenu(None);
         let installed_custom_status_view = false;
         let status_view = button_view.retain();
         let status_view: &NSView = &status_view;
         let local_status_view = status_view.retain();
         set_context_menu_on_view_tree(status_view, ns_menu);
         update_native_tray_rect_from_view(status_view);
+        install_status_item_system_menu(&app_handle, ns_menu, &status_item, status_view);
         if !installed_custom_status_view {
             install_status_button_action_target(ns_menu, &status_item, &button);
             install_status_view_context_click_gestures(ns_menu, &status_item, status_view);
@@ -489,6 +495,93 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
     }) {
         log::warn!("tray context menu: failed to install native menu: {error}");
     }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct TrayStatusItemMenuDelegateIvars {
+    app_handle: AppHandle,
+    status_view: objc2::rc::Retained<objc2_app_kit::NSView>,
+}
+
+#[cfg(target_os = "macos")]
+objc2::define_class!(
+    #[derive(Debug)]
+    #[unsafe(super(objc2_foundation::NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "OpenUsageTrayStatusItemMenuDelegate"]
+    #[ivars = TrayStatusItemMenuDelegateIvars]
+    struct TrayStatusItemMenuDelegate;
+
+    unsafe impl NSObjectProtocol for TrayStatusItemMenuDelegate {}
+
+    unsafe impl NSMenuDelegate for TrayStatusItemMenuDelegate {
+        #[allow(non_snake_case)]
+        #[unsafe(method(menuWillOpen:))]
+        fn menuWillOpen(&self, menu: &objc2_app_kit::NSMenu) {
+            let Some(mtm) = objc2_foundation::MainThreadMarker::new() else {
+                log::warn!("tray context menu: status item menu delegate off main thread");
+                return;
+            };
+            let application = objc2_app_kit::NSApplication::sharedApplication(mtm);
+            let Some(event) = application.currentEvent() else {
+                mark_native_menu_opened(std::time::Instant::now());
+                log::debug!("tray context menu: system status menu opening without current event");
+                return;
+            };
+
+            log::debug!(
+                "tray context menu: system status menu opening event_type={:?} button={}",
+                event.r#type(),
+                event.buttonNumber()
+            );
+            mark_native_menu_opened(std::time::Instant::now());
+            if !should_cancel_status_item_system_menu_for_primary_click(&event) {
+                update_native_tray_rect_from_view(&self.ivars().status_view);
+                return;
+            }
+
+            log::debug!("tray context menu: cancelling system menu for primary click");
+            menu.cancelTrackingWithoutAnimation();
+            update_native_tray_rect_from_view(&self.ivars().status_view);
+            toggle_panel(&self.ivars().app_handle);
+        }
+    }
+);
+
+#[cfg(target_os = "macos")]
+impl TrayStatusItemMenuDelegate {
+    fn new(
+        app_handle: &AppHandle,
+        status_view: &objc2_app_kit::NSView,
+    ) -> objc2::rc::Retained<Self> {
+        let mtm = objc2_foundation::MainThreadMarker::new().expect("main thread");
+        let this = Self::alloc(mtm).set_ivars(TrayStatusItemMenuDelegateIvars {
+            app_handle: app_handle.clone(),
+            status_view: status_view.retain(),
+        });
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_status_item_system_menu(
+    app_handle: &AppHandle,
+    menu: &objc2_app_kit::NSMenu,
+    status_item: &objc2_app_kit::NSStatusItem,
+    status_view: &objc2_app_kit::NSView,
+) {
+    let delegate = TrayStatusItemMenuDelegate::new(app_handle, status_view);
+    let delegate: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_app_kit::NSMenuDelegate>,
+    > = objc2::runtime::ProtocolObject::from_retained(delegate);
+
+    menu.setDelegate(Some(&delegate));
+    status_item.setMenu(Some(menu));
+
+    // NSMenu's delegate is weak.
+    std::mem::forget(delegate);
+    log::debug!("tray context menu: installed status item system menu");
 }
 
 #[cfg(target_os = "macos")]
@@ -758,6 +851,28 @@ fn should_handle_primary_status_item_click(event: &objc2_app_kit::NSEvent) -> bo
 
 #[cfg(target_os = "macos")]
 fn should_handle_primary_status_item_click_details(
+    event_type: objc2_app_kit::NSEventType,
+    modifier_flags: objc2_app_kit::NSEventModifierFlags,
+    button_number: isize,
+) -> bool {
+    use objc2_app_kit::{NSEventModifierFlags, NSEventType};
+
+    (event_type == NSEventType::LeftMouseDown || event_type == NSEventType::LeftMouseUp)
+        && button_number == 0
+        && !modifier_flags.contains(NSEventModifierFlags::Control)
+}
+
+#[cfg(target_os = "macos")]
+fn should_cancel_status_item_system_menu_for_primary_click(event: &objc2_app_kit::NSEvent) -> bool {
+    should_cancel_status_item_system_menu_for_primary_click_details(
+        event.r#type(),
+        event.modifierFlags(),
+        event.buttonNumber(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn should_cancel_status_item_system_menu_for_primary_click_details(
     event_type: objc2_app_kit::NSEventType,
     modifier_flags: objc2_app_kit::NSEventModifierFlags,
     button_number: isize,
@@ -1988,6 +2103,15 @@ fn should_skip_recent_native_menu_open(now: std::time::Instant) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+fn mark_native_menu_opened(now: std::time::Instant) {
+    let Ok(mut last_opened_at) = native_menu_last_opened_at().lock() else {
+        return;
+    };
+
+    *last_opened_at = Some(now);
+}
+
+#[cfg(target_os = "macos")]
 fn native_menu_recently_opened_for_mouse_up(now: std::time::Instant) -> bool {
     let Ok(last_opened_at) = native_menu_last_opened_at().lock() else {
         return false;
@@ -2389,6 +2513,48 @@ mod tests {
             NSEventModifierFlags::empty(),
             1
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn status_item_system_menu_cancel_only_for_plain_primary_clicks() {
+        use objc2_app_kit::{NSEventModifierFlags, NSEventType};
+
+        assert!(
+            should_cancel_status_item_system_menu_for_primary_click_details(
+                NSEventType::LeftMouseDown,
+                NSEventModifierFlags::empty(),
+                0
+            )
+        );
+        assert!(
+            should_cancel_status_item_system_menu_for_primary_click_details(
+                NSEventType::LeftMouseUp,
+                NSEventModifierFlags::empty(),
+                0
+            )
+        );
+        assert!(
+            !should_cancel_status_item_system_menu_for_primary_click_details(
+                NSEventType::LeftMouseDown,
+                NSEventModifierFlags::Control,
+                0
+            )
+        );
+        assert!(
+            !should_cancel_status_item_system_menu_for_primary_click_details(
+                NSEventType::RightMouseDown,
+                NSEventModifierFlags::empty(),
+                1
+            )
+        );
+        assert!(
+            !should_cancel_status_item_system_menu_for_primary_click_details(
+                NSEventType::OtherMouseDown,
+                NSEventModifierFlags::empty(),
+                2
+            )
+        );
     }
 
     #[cfg(target_os = "macos")]
