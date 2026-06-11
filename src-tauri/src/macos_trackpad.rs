@@ -157,10 +157,10 @@ fn install_raw_trackpad_menu_timer(
 unsafe extern "C" fn raw_trackpad_contact_callback(
     _device: MTDeviceRef,
     _touches: *mut libc::c_void,
-    active_fingers: libc::c_int,
+    active_fingers: libc::size_t,
     _timestamp: libc::c_double,
-    _frame: libc::c_int,
-) -> libc::c_int {
+    _frame: libc::size_t,
+) {
     if let Some(state) = RAW_TRACKPAD_TOUCH_STATE.get() {
         let active_fingers = normalize_raw_active_fingers(active_fingers);
         let now_millis = raw_trackpad_elapsed_millis();
@@ -182,12 +182,10 @@ unsafe extern "C" fn raw_trackpad_contact_callback(
             }
         }
     }
-
-    0
 }
 
-fn normalize_raw_active_fingers(active_fingers: libc::c_int) -> usize {
-    usize::try_from(active_fingers.max(0)).unwrap_or(0)
+fn normalize_raw_active_fingers(active_fingers: libc::size_t) -> usize {
+    active_fingers
 }
 
 fn should_log_raw_callback_frame(
