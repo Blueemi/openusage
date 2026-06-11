@@ -370,6 +370,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         status_item.setMenu(None);
         install_status_item_event_tap(ns_menu, status_view);
         install_secondary_click_poll_timer(ns_menu, status_view);
+        crate::macos_status_item_event_monitor::install(ns_menu, status_view);
         crate::macos_hid_secondary_click::install(ns_menu, status_view);
         crate::macos_trackpad::install_context_click_fallback(ns_menu, status_view);
         log::debug!("tray context menu: using custom status item view without overlay");
@@ -2094,7 +2095,7 @@ fn is_point_inside_rect_with_padding(
 }
 
 #[cfg(target_os = "macos")]
-fn should_open_tray_menu_from_native_event(event: &objc2_app_kit::NSEvent) -> bool {
+pub(crate) fn should_open_tray_menu_from_native_event(event: &objc2_app_kit::NSEvent) -> bool {
     should_open_tray_menu_from_native_event_details(
         event.r#type(),
         event.modifierFlags(),
