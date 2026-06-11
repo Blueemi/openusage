@@ -373,7 +373,10 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         crate::macos_status_item_event_monitor::install(ns_menu, status_view);
         crate::macos_hid_secondary_click::install(ns_menu, status_view);
         crate::macos_trackpad::install_context_click_fallback(ns_menu, status_view);
-        log::debug!("tray context menu: using custom status item view without overlay");
+        if should_install_tray_input_overlay_window(true) {
+            install_tray_input_overlay_window(&app_handle, ns_menu, status_view);
+        }
+        log::debug!("tray context menu: using custom status item view with input overlay");
 
         // Keep the muda menu alive for manually popped AppKit menu actions.
         std::mem::forget(status_view.retain());
