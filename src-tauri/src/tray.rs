@@ -339,7 +339,6 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         };
         let ns_menu = unsafe { &*(menu.ns_menu().cast::<NSMenu>()) };
         let local_ns_menu = ns_menu.retain();
-        let local_status_item = status_item.retain();
         let button_view: &NSView = button.as_super().as_super().as_super();
         let custom_status_view = crate::macos_status_item_view::install(
             &app_handle,
@@ -360,7 +359,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         if !installed_custom_status_view {
             install_status_button_action_target(ns_menu, &status_item, &button);
             install_status_view_context_click_gestures(ns_menu, &status_item, status_view);
-            install_tray_input_view(&app_handle, ns_menu, &status_item, status_view);
+            install_tray_input_view(&app_handle, ns_menu, status_view);
         }
 
         let Some(window) = status_view.window() else {
@@ -371,11 +370,10 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
 
         let status_window_number = window.windowNumber();
         let global_ns_menu = ns_menu.retain();
-        let global_status_item = status_item.retain();
         let global_status_view = status_view.retain();
-        install_status_item_event_tap(ns_menu, &status_item, status_view);
-        install_secondary_click_poll_timer(ns_menu, &status_item, status_view);
-        crate::macos_trackpad::install_context_click_fallback(ns_menu, &status_item, status_view);
+        install_status_item_event_tap(ns_menu, status_view);
+        install_secondary_click_poll_timer(ns_menu, status_view);
+        crate::macos_trackpad::install_context_click_fallback(ns_menu, status_view);
         log::debug!("tray context menu: installed on status button view tree");
 
         let last_event_number = Cell::new(-1);
@@ -394,7 +392,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
                 log::debug!(
                     "tray context menu: opening from two-touch status item event touch_count={touch_count}"
                 );
-                show_native_tray_menu(&local_status_item, &local_ns_menu);
+                show_native_tray_menu_at_view(&local_ns_menu, &local_status_view);
                 return ptr::null_mut();
             }
             if should_reset_touch_menu_gate(touch_count) {
@@ -426,7 +424,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
             }
             last_event_number.set(event_number);
 
-            show_native_tray_menu(&local_status_item, &local_ns_menu);
+            show_native_tray_menu_at_view(&local_ns_menu, &local_status_view);
 
             ptr::null_mut()
         });
@@ -466,7 +464,7 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
             }
             last_global_event_number.set(event_number);
 
-            show_native_tray_menu(&global_status_item, &global_ns_menu);
+            show_native_tray_menu_at_view(&global_ns_menu, &global_status_view);
         });
         let global_block_ref: &block2::DynBlock<dyn Fn(NonNull<NSEvent>)> = &global_block;
         let global_token =
@@ -877,7 +875,6 @@ fn round_to_u32(value: f64) -> u32 {
 struct TrayInputOverlayViewIvars {
     app_handle: AppHandle,
     menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
-    status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
     status_view: objc2::rc::Retained<objc2_app_kit::NSView>,
     suppress_next_mouse_up: std::cell::Cell<bool>,
     two_touch_menu_open: std::cell::Cell<bool>,
@@ -999,7 +996,7 @@ impl TrayInputOverlayView {
 
     fn open_context_menu(&self) {
         self.update_tray_rect();
-        show_native_tray_menu(&self.ivars().status_item, &self.ivars().menu);
+        show_native_tray_menu_at_view(&self.ivars().menu, &self.ivars().status_view);
     }
 
     fn open_context_menu_for_event(&self, event: &objc2_app_kit::NSEvent) {
@@ -1046,7 +1043,6 @@ impl TrayInputOverlayView {
 fn install_tray_input_view(
     app_handle: &AppHandle,
     menu: &objc2_app_kit::NSMenu,
-    status_item: &objc2_app_kit::NSStatusItem,
     status_view: &objc2_app_kit::NSView,
 ) {
     use objc2::ClassType;
@@ -1063,7 +1059,6 @@ fn install_tray_input_view(
         let view = mtm.alloc().set_ivars(TrayInputOverlayViewIvars {
             app_handle: app_handle.clone(),
             menu: menu.retain(),
-            status_item: status_item.retain(),
             status_view: status_view.retain(),
             suppress_next_mouse_up: std::cell::Cell::new(false),
             two_touch_menu_open: std::cell::Cell::new(false),
@@ -1174,7 +1169,6 @@ fn overlay_mouse_up_action_details(
 #[derive(Debug)]
 struct TrayEventTapState {
     menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
-    status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
     status_view: objc2::rc::Retained<objc2_app_kit::NSView>,
     mode: TrayEventTapMode,
 }
@@ -1190,7 +1184,6 @@ enum TrayEventTapMode {
 #[derive(Debug)]
 struct TraySecondaryClickPollState {
     menu: objc2::rc::Retained<objc2_app_kit::NSMenu>,
-    status_item: objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
     status_view: objc2::rc::Retained<objc2_app_kit::NSView>,
     secondary_button_was_down: std::cell::Cell<bool>,
 }
@@ -1198,7 +1191,6 @@ struct TraySecondaryClickPollState {
 #[cfg(target_os = "macos")]
 fn install_secondary_click_poll_timer(
     menu: &objc2_app_kit::NSMenu,
-    status_item: &objc2_app_kit::NSStatusItem,
     status_view: &objc2_app_kit::NSView,
 ) {
     use objc2_foundation::NSTimer;
@@ -1206,7 +1198,6 @@ fn install_secondary_click_poll_timer(
 
     let state = std::rc::Rc::new(TraySecondaryClickPollState {
         menu: menu.retain(),
-        status_item: status_item.retain(),
         status_view: status_view.retain(),
         secondary_button_was_down: std::cell::Cell::new(false),
     });
@@ -1223,7 +1214,7 @@ fn install_secondary_click_poll_timer(
             is_mouse_inside_status_view(&block_state.status_view),
         ) {
             log::debug!("tray context menu: polled secondary button down");
-            show_native_tray_menu(&block_state.status_item, &block_state.menu);
+            show_native_tray_menu_at_view(&block_state.menu, &block_state.status_view);
         }
     });
     let block_ref: &block2::DynBlock<dyn Fn(NonNull<NSTimer>)> = &block;
@@ -1239,28 +1230,24 @@ fn install_secondary_click_poll_timer(
 #[cfg(target_os = "macos")]
 fn install_status_item_event_tap(
     menu: &objc2_app_kit::NSMenu,
-    status_item: &objc2_app_kit::NSStatusItem,
     status_view: &objc2_app_kit::NSView,
 ) {
     use objc2_core_graphics::CGEventTapLocation;
 
     install_status_item_event_tap_at_location(
         menu,
-        status_item,
         status_view,
         CGEventTapLocation::HIDEventTap,
         TrayEventTapMode::Active,
     );
     install_status_item_event_tap_at_location(
         menu,
-        status_item,
         status_view,
         CGEventTapLocation::SessionEventTap,
         TrayEventTapMode::ListenOnly,
     );
     install_status_item_event_tap_at_location(
         menu,
-        status_item,
         status_view,
         CGEventTapLocation::AnnotatedSessionEventTap,
         TrayEventTapMode::ListenOnly,
@@ -1270,7 +1257,6 @@ fn install_status_item_event_tap(
 #[cfg(target_os = "macos")]
 fn install_status_item_event_tap_at_location(
     menu: &objc2_app_kit::NSMenu,
-    status_item: &objc2_app_kit::NSStatusItem,
     status_view: &objc2_app_kit::NSView,
     location: objc2_core_graphics::CGEventTapLocation,
     mode: TrayEventTapMode,
@@ -1280,7 +1266,6 @@ fn install_status_item_event_tap_at_location(
 
     let state = Box::new(TrayEventTapState {
         menu: menu.retain(),
-        status_item: status_item.retain(),
         status_view: status_view.retain(),
         mode,
     });
@@ -1366,7 +1351,7 @@ unsafe extern "C-unwind" fn status_item_event_tap_callback(
             "tray context menu: CoreGraphics event tap open event_type={:?}",
             event_type
         );
-        show_native_tray_menu(&state.status_item, &state.menu);
+        show_native_tray_menu_at_view(&state.menu, &state.status_view);
         if should_swallow_opened_cg_event(state.mode, event_type, cg_event) {
             return std::ptr::null_mut();
         }

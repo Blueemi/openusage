@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use objc2::Message;
-use objc2_app_kit::{NSMenu, NSStatusItem, NSView};
+use objc2_app_kit::{NSMenu, NSView};
 
 type MTDeviceRef = *mut libc::c_void;
 type CFArrayRef = *const libc::c_void;
@@ -24,6 +24,7 @@ type MTDeviceStart = unsafe extern "C" fn(MTDeviceRef, libc::c_int);
 const MULTITOUCH_FRAMEWORK_PATH: &str =
     "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport";
 const RAW_TRACKPAD_IDLE_END_MILLIS: u64 = 160;
+const RAW_TRACKPAD_RECENT_TWO_FINGER_MILLIS: u64 = 300;
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
@@ -35,6 +36,7 @@ unsafe extern "C" {
 struct RawTrackpadTouchState {
     active_fingers: AtomicUsize,
     last_update_millis: AtomicU64,
+    last_two_finger_millis: AtomicU64,
     runtime_started: AtomicBool,
 }
 
@@ -43,6 +45,7 @@ impl RawTrackpadTouchState {
         Self {
             active_fingers: AtomicUsize::new(0),
             last_update_millis: AtomicU64::new(0),
+            last_two_finger_millis: AtomicU64::new(0),
             runtime_started: AtomicBool::new(false),
         }
     }
@@ -51,7 +54,6 @@ impl RawTrackpadTouchState {
 #[derive(Debug)]
 struct RawTrackpadMenuTimerState {
     menu: objc2::rc::Retained<NSMenu>,
-    status_item: objc2::rc::Retained<NSStatusItem>,
     status_view: objc2::rc::Retained<NSView>,
     touch_state: Arc<RawTrackpadTouchState>,
     two_finger_was_active: std::cell::Cell<bool>,
@@ -67,11 +69,7 @@ struct MultitouchSupportRuntime {
 
 static RAW_TRACKPAD_TOUCH_STATE: OnceLock<Arc<RawTrackpadTouchState>> = OnceLock::new();
 
-pub(crate) fn install_context_click_fallback(
-    menu: &NSMenu,
-    status_item: &NSStatusItem,
-    status_view: &NSView,
-) {
+pub(crate) fn install_context_click_fallback(menu: &NSMenu, status_view: &NSView) {
     let touch_state = RAW_TRACKPAD_TOUCH_STATE
         .get_or_init(|| Arc::new(RawTrackpadTouchState::new()))
         .clone();
@@ -80,7 +78,7 @@ pub(crate) fn install_context_click_fallback(
         return;
     }
 
-    install_raw_trackpad_menu_timer(menu, status_item, status_view, touch_state);
+    install_raw_trackpad_menu_timer(menu, status_view, touch_state);
 }
 
 fn start_raw_trackpad_listener(touch_state: &RawTrackpadTouchState) -> bool {
@@ -107,7 +105,6 @@ fn start_raw_trackpad_listener(touch_state: &RawTrackpadTouchState) -> bool {
 
 fn install_raw_trackpad_menu_timer(
     menu: &NSMenu,
-    status_item: &NSStatusItem,
     status_view: &NSView,
     touch_state: Arc<RawTrackpadTouchState>,
 ) {
@@ -116,7 +113,6 @@ fn install_raw_trackpad_menu_timer(
 
     let state = std::rc::Rc::new(RawTrackpadMenuTimerState {
         menu: menu.retain(),
-        status_item: status_item.retain(),
         status_view: status_view.retain(),
         touch_state,
         two_finger_was_active: std::cell::Cell::new(false),
@@ -125,21 +121,25 @@ fn install_raw_trackpad_menu_timer(
     });
     let block_state = state.clone();
     let block = block2::RcBlock::new(move |_timer: NonNull<NSTimer>| {
-        let active_fingers = current_raw_active_fingers(&block_state.touch_state);
+        let now_millis = raw_trackpad_elapsed_millis();
+        let active_fingers = current_raw_active_fingers(&block_state.touch_state, now_millis);
         let two_finger_is_active = active_fingers >= 2;
+        let recent_two_finger_seen =
+            recent_raw_two_finger_seen(&block_state.touch_state, now_millis);
+        let two_finger_signal_is_active = two_finger_is_active || recent_two_finger_seen;
         let cursor_inside_status_view =
             crate::tray::is_mouse_inside_status_view(&block_state.status_view);
         let two_finger_was_active = block_state
             .two_finger_was_active
-            .replace(two_finger_is_active);
+            .replace(two_finger_signal_is_active);
         let sequence_inside_status_view = block_state.two_finger_sequence_inside_status_view.get()
-            || (two_finger_is_active && cursor_inside_status_view);
+            || (two_finger_signal_is_active && cursor_inside_status_view);
         block_state
             .two_finger_sequence_inside_status_view
             .set(sequence_inside_status_view);
 
         if should_open_raw_trackpad_menu_while_sequence_active(
-            two_finger_is_active,
+            two_finger_signal_is_active,
             cursor_inside_status_view,
             block_state.menu_opened_for_sequence.get(),
         ) {
@@ -147,13 +147,13 @@ fn install_raw_trackpad_menu_timer(
             log::debug!(
                 "tray context menu: raw trackpad two-finger sequence active inside status view"
             );
-            crate::tray::show_native_tray_menu(&block_state.status_item, &block_state.menu);
+            crate::tray::show_native_tray_menu_at_view(&block_state.menu, &block_state.status_view);
             return;
         }
 
         if should_open_raw_trackpad_menu_on_sequence_end(
             two_finger_was_active,
-            two_finger_is_active,
+            two_finger_signal_is_active,
             sequence_inside_status_view,
             block_state.menu_opened_for_sequence.get(),
         ) {
@@ -164,8 +164,8 @@ fn install_raw_trackpad_menu_timer(
             log::debug!(
                 "tray context menu: raw trackpad two-finger sequence ended active_fingers={active_fingers}"
             );
-            crate::tray::show_native_tray_menu(&block_state.status_item, &block_state.menu);
-        } else if !two_finger_is_active {
+            crate::tray::show_native_tray_menu_at_view(&block_state.menu, &block_state.status_view);
+        } else if !two_finger_signal_is_active {
             block_state
                 .two_finger_sequence_inside_status_view
                 .set(false);
@@ -289,10 +289,14 @@ unsafe extern "C" fn raw_trackpad_contact_callback(
 ) -> libc::c_int {
     if let Some(state) = RAW_TRACKPAD_TOUCH_STATE.get() {
         let active_fingers = active_fingers.max(0) as usize;
+        let now_millis = raw_trackpad_elapsed_millis();
         let previous = state.active_fingers.swap(active_fingers, Ordering::SeqCst);
-        state
-            .last_update_millis
-            .store(raw_trackpad_elapsed_millis(), Ordering::SeqCst);
+        state.last_update_millis.store(now_millis, Ordering::SeqCst);
+        if active_fingers >= 2 {
+            state
+                .last_two_finger_millis
+                .store(now_millis, Ordering::SeqCst);
+        }
         if previous != active_fingers {
             log::debug!("tray context menu: raw trackpad active_fingers={active_fingers}");
         }
@@ -301,14 +305,14 @@ unsafe extern "C" fn raw_trackpad_contact_callback(
     0
 }
 
-fn current_raw_active_fingers(state: &RawTrackpadTouchState) -> usize {
+fn current_raw_active_fingers(state: &RawTrackpadTouchState, now_millis: u64) -> usize {
     let active_fingers = state.active_fingers.load(Ordering::SeqCst);
     if active_fingers < 2 {
         return active_fingers;
     }
 
     if raw_trackpad_update_is_stale(
-        raw_trackpad_elapsed_millis(),
+        now_millis,
         state.last_update_millis.load(Ordering::SeqCst),
         RAW_TRACKPAD_IDLE_END_MILLIS,
     ) {
@@ -317,6 +321,19 @@ fn current_raw_active_fingers(state: &RawTrackpadTouchState) -> usize {
     }
 
     active_fingers
+}
+
+fn recent_raw_two_finger_seen(state: &RawTrackpadTouchState, now_millis: u64) -> bool {
+    let last_two_finger_millis = state.last_two_finger_millis.load(Ordering::SeqCst);
+    if last_two_finger_millis == 0 {
+        return false;
+    }
+
+    !raw_trackpad_update_is_stale(
+        now_millis,
+        last_two_finger_millis,
+        RAW_TRACKPAD_RECENT_TWO_FINGER_MILLIS,
+    )
 }
 
 fn raw_trackpad_update_is_stale(
@@ -358,30 +375,5 @@ fn should_open_raw_trackpad_menu_while_sequence_active(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn raw_trackpad_menu_opens_when_two_finger_sequence_ends_inside_status_view() {
-        assert!(should_open_raw_trackpad_menu_on_sequence_end(true, false, true, false));
-        assert!(!should_open_raw_trackpad_menu_on_sequence_end(false, true, true, false));
-        assert!(!should_open_raw_trackpad_menu_on_sequence_end(true, true, true, false));
-        assert!(!should_open_raw_trackpad_menu_on_sequence_end(true, false, false, false));
-        assert!(!should_open_raw_trackpad_menu_on_sequence_end(true, false, true, true));
-    }
-
-    #[test]
-    fn raw_trackpad_menu_opens_while_two_fingers_are_active_inside_status_view() {
-        assert!(should_open_raw_trackpad_menu_while_sequence_active(true, true, false));
-        assert!(!should_open_raw_trackpad_menu_while_sequence_active(true, true, true));
-        assert!(!should_open_raw_trackpad_menu_while_sequence_active(true, false, false));
-        assert!(!should_open_raw_trackpad_menu_while_sequence_active(false, true, false));
-    }
-
-    #[test]
-    fn stale_raw_trackpad_update_ends_two_finger_sequence() {
-        assert!(!raw_trackpad_update_is_stale(100, 0, 160));
-        assert!(!raw_trackpad_update_is_stale(259, 100, 160));
-        assert!(raw_trackpad_update_is_stale(260, 100, 160));
-    }
-}
+#[path = "macos_trackpad_tests.rs"]
+mod macos_trackpad_tests;
