@@ -340,18 +340,12 @@ fn install_native_tray_context_menu(app_handle: &AppHandle, tray: &tauri::tray::
         let ns_menu = unsafe { &*(menu.ns_menu().cast::<NSMenu>()) };
         let local_ns_menu = ns_menu.retain();
         let button_view: &NSView = button.as_super().as_super().as_super();
-        let custom_status_view = crate::macos_status_item_view::install(
-            &app_handle,
-            ns_menu,
-            &status_item,
-            button.image().as_deref(),
-            button_view.bounds().size,
-        );
-        let installed_custom_status_view = custom_status_view.is_some();
-        let status_view = custom_status_view.unwrap_or_else(|| {
-            status_item.setMenu(Some(ns_menu));
+        crate::macos_status_item_icon::install_native_button(&status_item, &button);
+        let installed_custom_status_view = false;
+        let status_view = {
+            status_item.setMenu(None);
             button_view.retain()
-        });
+        };
         let status_view: &NSView = &status_view;
         let local_status_view = status_view.retain();
         set_context_menu_on_view_tree(status_view, ns_menu);
@@ -1838,6 +1832,7 @@ fn show_native_tray_menu_at_view_on_main(
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 pub(crate) fn show_native_tray_menu_for_event(
     menu: &objc2_app_kit::NSMenu,
     event: &objc2_app_kit::NSEvent,

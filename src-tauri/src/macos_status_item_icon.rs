@@ -1,5 +1,7 @@
 use objc2::{AnyThread as _, ClassType as _, Message};
-use objc2_app_kit::{NSImage, NSImageView, NSStatusItem, NSView};
+use objc2_app_kit::{
+    NSButton, NSImage, NSImageScaling, NSImageView, NSStatusBarButton, NSStatusItem, NSView,
+};
 use objc2_foundation::{NSData, NSPoint, NSRect, NSSize};
 use std::cell::RefCell;
 use std::io::Cursor;
@@ -7,7 +9,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::AppHandle;
 
 pub(crate) const STATUS_ITEM_WIDTH: f64 = 24.0;
-pub(crate) const STATUS_ITEM_HEIGHT: f64 = 22.0;
 pub(crate) const STATUS_ITEM_MENU_BAR_HIT_HEIGHT: f64 = 30.0;
 const STATUS_ITEM_ICON_SIZE: f64 = 18.0;
 const STATUS_ITEM_HORIZONTAL_PADDING: f64 = 6.0;
@@ -21,8 +22,11 @@ thread_local! {
         RefCell::new(None);
     static CUSTOM_STATUS_VIEW: RefCell<Option<objc2::rc::Retained<NSView>>> =
         RefCell::new(None);
+    static NATIVE_STATUS_BUTTON: RefCell<Option<objc2::rc::Retained<NSStatusBarButton>>> =
+        RefCell::new(None);
 }
 
+#[allow(dead_code)]
 pub(crate) fn install(status_item: &NSStatusItem, status_view: &NSView, image_view: &NSImageView) {
     CUSTOM_STATUS_VIEW_INSTALLED.store(true, Ordering::SeqCst);
     CUSTOM_STATUS_IMAGE_VIEW.with(|slot| {
@@ -34,8 +38,29 @@ pub(crate) fn install(status_item: &NSStatusItem, status_view: &NSView, image_vi
     CUSTOM_STATUS_VIEW.with(|slot| {
         *slot.borrow_mut() = Some(status_view.retain());
     });
+    NATIVE_STATUS_BUTTON.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
 }
 
+pub(crate) fn install_native_button(status_item: &NSStatusItem, button: &NSStatusBarButton) {
+    CUSTOM_STATUS_VIEW_INSTALLED.store(true, Ordering::SeqCst);
+    CUSTOM_STATUS_IMAGE_VIEW.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+    CUSTOM_STATUS_ITEM.with(|slot| {
+        *slot.borrow_mut() = Some(status_item.retain());
+    });
+    CUSTOM_STATUS_VIEW.with(|slot| {
+        *slot.borrow_mut() = Some(button.as_super().as_super().as_super().retain());
+    });
+    NATIVE_STATUS_BUTTON.with(|slot| {
+        *slot.borrow_mut() = Some(button.retain());
+    });
+    log::warn!("tray context menu: using native status bar button");
+}
+
+#[allow(dead_code)]
 pub(crate) fn initial_image_frame(size: NSSize) -> NSRect {
     status_item_image_frame_for_icon_size(
         size,
@@ -84,32 +109,40 @@ fn set_icon_rgba_on_main(
     image.setTemplate(is_template);
 
     CUSTOM_STATUS_IMAGE_VIEW.with(|image_view_slot| {
-        CUSTOM_STATUS_ITEM.with(|status_item_slot| {
-            CUSTOM_STATUS_VIEW.with(|status_view_slot| {
-                let image_view = image_view_slot.borrow();
-                let status_item = status_item_slot.borrow();
-                let status_view = status_view_slot.borrow();
-                let Some(image_view) = image_view.as_ref() else {
-                    return Err("custom status image view missing".to_string());
-                };
-                let Some(status_item) = status_item.as_ref() else {
-                    return Err("custom status item missing".to_string());
-                };
-                let Some(status_view) = status_view.as_ref() else {
-                    return Err("custom status view missing".to_string());
-                };
+        NATIVE_STATUS_BUTTON.with(|button_slot| {
+            CUSTOM_STATUS_ITEM.with(|status_item_slot| {
+                CUSTOM_STATUS_VIEW.with(|status_view_slot| {
+                    let image_view = image_view_slot.borrow();
+                    let button = button_slot.borrow();
+                    let status_item = status_item_slot.borrow();
+                    let status_view = status_view_slot.borrow();
+                    let Some(status_item) = status_item.as_ref() else {
+                        return Err("custom status item missing".to_string());
+                    };
+                    let Some(status_view) = status_view.as_ref() else {
+                        return Err("custom status view missing".to_string());
+                    };
 
-                let item_size = status_item_size_for_icon_size(image_size);
-                status_item.setLength(item_size.width);
-                status_view.setFrameSize(item_size);
-                status_view.setBoundsSize(item_size);
-                image_view
-                    .as_super()
-                    .as_super()
-                    .setFrame(status_item_image_frame_for_icon_size(item_size, image_size));
-                image_view.setImage(Some(&image));
-                crate::tray::update_native_tray_rect_from_view(status_view);
-                Ok(())
+                    let item_size = status_item_size_for_icon_size(image_size);
+                    status_item.setLength(item_size.width);
+                    if let Some(image_view) = image_view.as_ref() {
+                        status_view.setFrameSize(item_size);
+                        status_view.setBoundsSize(item_size);
+                        image_view
+                            .as_super()
+                            .as_super()
+                            .setFrame(status_item_image_frame_for_icon_size(item_size, image_size));
+                        image_view.setImage(Some(&image));
+                    } else if let Some(button) = button.as_ref() {
+                        let button: &NSButton = button.as_super();
+                        button.setImageScaling(NSImageScaling::ScaleProportionallyDown);
+                        button.setImage(Some(&image));
+                    } else {
+                        return Err("status icon target missing".to_string());
+                    }
+                    crate::tray::update_native_tray_rect_from_view(status_view);
+                    Ok(())
+                })
             })
         })
     })

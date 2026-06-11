@@ -6,6 +6,7 @@ mod log_path;
 #[cfg(target_os = "macos")]
 mod macos_status_item_icon;
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 mod macos_status_item_view;
 #[cfg(target_os = "macos")]
 mod macos_trackpad;

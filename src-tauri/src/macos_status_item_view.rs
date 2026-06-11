@@ -1,5 +1,5 @@
 use crate::macos_status_item_icon::{
-    STATUS_ITEM_HEIGHT, STATUS_ITEM_MENU_BAR_HIT_HEIGHT, STATUS_ITEM_WIDTH, initial_image_frame,
+    STATUS_ITEM_MENU_BAR_HIT_HEIGHT, STATUS_ITEM_WIDTH, initial_image_frame,
 };
 use objc2::{ClassType, DeclaredClass, Message, msg_send};
 use objc2_app_kit::{
@@ -286,9 +286,7 @@ fn should_reset_touch_gate(touch_count: usize) -> bool {
 fn normalized_status_item_size(size: NSSize) -> NSSize {
     NSSize::new(
         size.width.max(STATUS_ITEM_WIDTH),
-        size.height
-            .max(STATUS_ITEM_HEIGHT)
-            .max(STATUS_ITEM_MENU_BAR_HIT_HEIGHT),
+        size.height.max(STATUS_ITEM_MENU_BAR_HIT_HEIGHT),
     )
 }
 
